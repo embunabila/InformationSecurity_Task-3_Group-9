@@ -3,6 +3,7 @@ import io
 import os
 import re
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from pypdf import PdfReader, PdfWriter
@@ -26,6 +27,13 @@ from share_errors import AlreadySignedError, InvalidPdfError
 SIGNER = "dummy_user"
 SIGNING_TIME = datetime(2026, 11, 27, 9, 30, 0, tzinfo=timezone.utc)
 PDF_DATE = "D:20261127093000+00'00'"
+
+FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURE_FILES = {
+    "01_Pemeriksaan_Lab_Word.pdf": {"xref": "hybrid", "version_added": False},
+    "02_Surat_Chrome.pdf": {"xref": "table", "version_added": True},
+}
+TEAM_NAMES = ("della", "embun", "nayla", "nuha")
 
 
 def _to_bytes(writer):
@@ -520,6 +528,108 @@ class EmbedSignatureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             embed_signature(bytearray(self.prepared), self.byte_range, self.cms)
 
+
+def xref_kind(pdf):
+    has_table = re.search(rb"(?m)^xref\s", pdf) is not None
+    has_stream = re.search(rb"/Type\s*/XRef\b", pdf) is not None
+    if has_table and b"/XRefStm" in pdf:
+        return "hybrid"
+    if has_table and not has_stream:
+        return "table"
+    if has_stream and not has_table:
+        return "stream"
+    return "mixed"
+
+
+class FixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.fixtures = [
+            (name, expected, (FIXTURES / name).read_bytes())
+            for name, expected in FIXTURE_FILES.items()
+        ]
+
+    def test_fixture_xref_structure(self):
+        for name, expected, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                self.assertEqual(xref_kind(pdf), expected["xref"])
+
+    def test_prepare_byte_layout(self):
+        for name, _, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                prepared, byte_range = prepare(pdf)
+                _, a, b, c = byte_range
+                self.assertTrue(prepared.startswith(pdf))
+                self.assertEqual(b + c, len(prepared))
+                self.assertEqual(
+                    prepared[a:b], b"<" + b"0" * (2 * CONTENTS_SIZE) + b">"
+                )
+
+    def test_prepare_structure(self):
+        for name, _, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                prepared, _ = prepare(pdf)
+                reader, field = find_new_field(prepared)
+                signature = field["/V"].get_object()
+                acroform = reader.trailer["/Root"]["/AcroForm"]
+                annot_ids = [ref.idnum for ref in reader.pages[0]["/Annots"]]
+
+                self.assertEqual(field["/T"], "Medimo-Signature")
+                self.assertEqual(signature["/Reason"], SIGNING_STATEMENT)
+                self.assertEqual(signature["/Name"], SIGNER)
+                self.assertEqual(acroform["/SigFlags"], 3)
+                self.assertIn(field.indirect_reference.idnum, annot_ids)
+                self.assertEqual(
+                    len(reader.pages), len(PdfReader(io.BytesIO(pdf)).pages)
+                )
+
+    def test_version_only_added_below_1_5(self):
+        for name, expected, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                prepared, _ = prepare(pdf)
+                root = PdfReader(io.BytesIO(prepared)).trailer["/Root"]
+                if expected["version_added"]:
+                    self.assertEqual(root["/Version"], "/1.5")
+                else:
+                    self.assertNotIn("/Version", root)
+
+    def test_mod_date_updated_and_info_kept(self):
+        for name, _, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                before = PdfReader(io.BytesIO(pdf)).metadata
+                prepared, _ = prepare(pdf)
+                after = PdfReader(io.BytesIO(prepared)).metadata
+
+                self.assertEqual(after["/ModDate"], PDF_DATE)
+                for key in before:
+                    if key != "/ModDate":
+                        self.assertEqual(after[key], before[key])
+
+    def test_prepare_then_embed_keeps_digest(self):
+        for name, _, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                prepared, byte_range = prepare(pdf)
+                before = byte_range_digest(prepared, byte_range)
+                signed = embed_signature(prepared, byte_range, os.urandom(2000))
+
+                self.assertEqual(byte_range_digest(signed, byte_range), before)
+                self.assertEqual(len(PdfReader(io.BytesIO(signed)).pages), 1)
+
+    def test_fixture_metadata_has_no_real_names(self):
+        for name, _, pdf in self.fixtures:
+            with self.subTest(fixture=name):
+                reader = PdfReader(io.BytesIO(pdf))
+                info = reader.metadata or {}
+                self.assertNotIn("/Author", info)
+
+                values = [str(value) for value in info.values()]
+                xmp = reader.xmp_metadata
+                if xmp is not None:
+                    self.assertFalse(xmp.dc_creator)
+                    values += [str(v) for v in (xmp.dc_title or {}).values()]
+
+                text = " ".join(values).lower()
+                for team_name in TEAM_NAMES:
+                    self.assertNotIn(team_name, text)
 
 if __name__ == "__main__":
     unittest.main()
