@@ -52,6 +52,8 @@ from access_routes import access_bp
 from grant_routes import grant_bp
 from keys_routes import keys_bp
 from request_routes import requests_bp
+from sign_routes import sign_bp
+from verify_routes import verify_bp
 from storage import (
     delete_envelope,
     delete_envelope_set,
@@ -78,6 +80,8 @@ app.register_blueprint(keys_bp)
 app.register_blueprint(requests_bp)
 app.register_blueprint(grant_bp)
 app.register_blueprint(access_bp)
+app.register_blueprint(sign_bp)
+app.register_blueprint(verify_bp)
 
 @app.route("/")
 def home():
