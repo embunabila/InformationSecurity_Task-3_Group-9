@@ -1,15 +1,11 @@
-"""Prepare, hash, and embed PDF digital signatures
+"""PDF signature preparation, hashing, and embedding."""
 
-The signature is added as an incremental update (ISO 32000-1 7.5.6), so
-the original PDF bytes stay untouched at the start of the signed file.
-The hash covers every byte except the /Contents hex string, including
-its "<" and ">" delimiters (ISO 32000-1 12.8.1).
-"""
-
+import hmac
 import io
 import re
 from datetime import datetime, timedelta
 
+from Crypto.Hash import SHA256
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PyPdfError
 from pypdf.generic import (
@@ -29,30 +25,15 @@ SIGNING_STATEMENT = (
     "setelah saya tanda tangani."
 )
 
-# Space reserved for the CMS SignedData inside /Contents (contract section 4).
 CONTENTS_SIZE = 8192
-
-# Fixed-width stand-in for the three unknown ByteRange numbers. Ten digits
-# cover any file Medimo accepts (25 MiB), so the real numbers always fit.
 BYTE_RANGE_PLACEHOLDER = 9_999_999_999
-
 FIELD_NAME = "Medimo-Signature"
 MAX_FIELD_NAME_ATTEMPTS = 100
-
-# /F 132 = Print (4) + Locked (128), ISO 32000-1 12.5.3.
-WIDGET_FLAGS = 132
-
-# SignaturesExist (1) + AppendOnly (2), ISO 32000-1 12.7.2.
-SIG_FLAGS = 3
-
-# Cross-reference streams need PDF 1.5 (ISO 32000-1 7.5.8), and pypdf
-# always writes the incremental update with one.
+WIDGET_FLAGS = 132  # Print + Locked
+SIG_FLAGS = 3  # SignaturesExist + AppendOnly
 XREF_STREAM_VERSION = (1, 5)
-
-# Guards against reference loops while walking the field tree.
 MAX_FIELD_DEPTH = 32
 
-# Errors pypdf may raise on a damaged file.
 _PDF_READ_ERRORS = (
     PyPdfError,
     ValueError,
@@ -84,12 +65,12 @@ def _check_signer_name(signer_name):
 
 
 def _pdf_date(signing_time):
-    """Format a UTC datetime as a PDF date string (ISO 32000-1 7.9.4)."""
+    """Return a PDF date string (ISO 32000-1 7.9.4)."""
     return signing_time.strftime("D:%Y%m%d%H%M%S+00'00'")
 
 
 def _parse_version(value):
-    """Return (major, minor) from "1.7", "/1.7" or "%PDF-1.7", else None."""
+    """Return (major, minor) parsed from a version string, or None."""
     match = re.search(r"(\d+)\.(\d+)", str(value))
     if match is None:
         return None
@@ -129,11 +110,7 @@ def _top_level_fields(acroform):
 
 
 def _has_filled_signature(fields):
-    """True if any field (or descendant) is /FT /Sig with a /V entry.
-
-    Deliberately minimal: it only answers "may we add a signature?".
-    Reading signatures for verification is extract_signatures (Nayla).
-    """
+    """Return True if any field or descendant is a /Sig field with /V."""
     seen = set()
     stack = [(field, None, 0) for field in fields]
 
@@ -153,7 +130,6 @@ def _has_filled_signature(fields):
                 continue
             seen.add(key)
 
-        # /FT is inheritable from the parent field (ISO 32000-1 12.7.3.1).
         field_type = field.get("/FT", inherited_type)
 
         if field_type == "/Sig" and field.get("/V") is not None:
@@ -222,8 +198,6 @@ def _add_signature_objects(writer, reader, signer_name, signing_time):
     field_name = _choose_field_name(fields)
     pdf_date = _pdf_date(signing_time)
 
-    # Text goes through pypdf string objects, never hand-built syntax,
-    # so a name cannot inject PDF syntax (contract section 4).
     signature = DictionaryObject(
         {
             NameObject("/Type"): NameObject("/Sig"),
@@ -236,8 +210,7 @@ def _add_signature_objects(writer, reader, signer_name, signing_time):
             NameObject("/Reason"): TextStringObject(SIGNING_STATEMENT),
         }
     )
-    # pypdf has no public "add object" call; _add_object is private API.
-    # The pypdf version is pinned (<7) and the tests below catch changes.
+    # _add_object is private pypdf API (pinned <7).
     signature_ref = writer._add_object(signature)
 
     widget = DictionaryObject(
@@ -254,7 +227,6 @@ def _add_signature_objects(writer, reader, signer_name, signing_time):
     )
     widget_ref = writer._add_object(widget)
 
-    # Append to existing arrays (direct or indirect); never replace them.
     annots = page.get("/Annots")
     if annots is None:
         page[NameObject("/Annots")] = ArrayObject([widget_ref])
@@ -286,13 +258,9 @@ def _add_signature_objects(writer, reader, signer_name, signing_time):
             int(old_flags) | SIG_FLAGS
         )
 
-    # Keep /Info in the new trailer (ISO 32000-1 7.5.6) by updating
-    # /ModDate, but only if the original PDF has /Info at all.
     if "/Info" in reader.trailer:
         writer.add_metadata({"/ModDate": pdf_date})
 
-    # The update uses a cross-reference stream (PDF 1.5). Raise the
-    # version through the catalog (ISO 32000-1 7.2.2) only when needed.
     header_version = _parse_version(reader.pdf_header)
     catalog_version = None
     if "/Version" in root:
@@ -309,18 +277,14 @@ def _add_signature_objects(writer, reader, signer_name, signing_time):
 def _locate_once(data, needle, label):
     first = data.find(needle)
     if first < 0 or data.find(needle, first + 1) >= 0:
-        # Missing means the object went into a compressed object stream;
-        # twice means the placeholder is ambiguous. Either is a bug.
         raise RuntimeError(f"{label} placeholder must appear exactly once.")
     return first
 
 
 def prepare_pdf_for_signing(pdf_bytes, signer_name, signing_time):
-    """Append an empty signature field to a PDF as an incremental update.
+    """Add an empty signature field as an incremental update.
 
-    Returns (prepared_pdf, byte_range). byte_range is [0, a, b, c]:
-    the signed bytes are prepared_pdf[0:a] + prepared_pdf[b:b + c], and
-    prepared_pdf[a:b] is the /Contents hex string "<00...00>".
+    Returns (prepared_pdf, [0, a, b, c]).
     """
     if not isinstance(pdf_bytes, bytes):
         raise ValueError("pdf_bytes must be bytes.")
@@ -364,7 +328,6 @@ def prepare_pdf_for_signing(pdf_bytes, signer_name, signing_time):
     c = len(prepared) - b
     byte_range = [0, a, b, c]
 
-    # Real numbers, padded with spaces so the file length does not change.
     filled = f"[ 0 {a} {b} {c}".encode("ascii")
     filled = filled.ljust(len(byte_range_needle) - 1) + b"]"
 
@@ -378,3 +341,80 @@ def prepare_pdf_for_signing(pdf_bytes, signer_name, signing_time):
     )
 
     return prepared, byte_range
+
+
+def _check_byte_range(byte_range, data_length):
+    """Validate the shape and bounds of [0, a, b, c]."""
+    if not isinstance(byte_range, (list, tuple)) or len(byte_range) != 4:
+        raise ValueError("byte_range must be four integers.")
+
+    for number in byte_range:
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError("byte_range must be four integers.")
+        if number < 0:
+            raise ValueError("byte_range numbers must not be negative.")
+
+    zero, a, b, c = byte_range
+
+    if zero != 0:
+        raise ValueError("byte_range must start at 0.")
+
+    if a >= b:
+        raise ValueError("byte_range gap must not be empty.")
+
+    if b + c > data_length:
+        raise ValueError("byte_range goes past the end of the PDF.")
+
+    return a, b, c
+
+
+def byte_range_digest(pdf_bytes, byte_range):
+    """Return SHA-256 of pdf_bytes[0:a] + pdf_bytes[b:b + c]."""
+    if not isinstance(pdf_bytes, bytes):
+        raise ValueError("pdf_bytes must be bytes.")
+
+    a, b, c = _check_byte_range(byte_range, len(pdf_bytes))
+
+    hasher = SHA256.new()
+    hasher.update(pdf_bytes[0:a])
+    hasher.update(pdf_bytes[b:b + c])
+    return hasher.digest()
+
+
+def _contents_gap():
+    """Return the placeholder bytes <00...00>."""
+    return _serialize(_contents_placeholder())
+
+
+def embed_signature(prepared_pdf, byte_range, cms_der):
+    """Write cms_der as uppercase hex into the /Contents placeholder."""
+    if not isinstance(prepared_pdf, bytes):
+        raise ValueError("prepared_pdf must be bytes.")
+
+    if not isinstance(cms_der, bytes):
+        raise ValueError("cms_der must be bytes.")
+
+    if not cms_der:
+        raise ValueError("cms_der must not be empty.")
+
+    if len(cms_der) > CONTENTS_SIZE:
+        raise ValueError("cms_der does not fit in /Contents.")
+
+    a, b, _ = _check_byte_range(byte_range, len(prepared_pdf))
+
+    if prepared_pdf[a:b] != _contents_gap():
+        raise ValueError("byte_range does not point to an empty /Contents.")
+
+    hex_width = 2 * CONTENTS_SIZE
+    filled = cms_der.hex().upper().encode("ascii").ljust(hex_width, b"0")
+
+    signed_pdf = prepared_pdf[:a + 1] + filled + prepared_pdf[b - 1:]
+
+    same_digest = hmac.compare_digest(
+        byte_range_digest(signed_pdf, byte_range),
+        byte_range_digest(prepared_pdf, byte_range),
+    )
+    if len(signed_pdf) != len(prepared_pdf) or not same_digest:
+        raise RuntimeError("Embedding changed bytes outside /Contents.")
+
+    return signed_pdf

@@ -1,4 +1,6 @@
+import hashlib
 import io
+import os
 import re
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,6 +17,8 @@ from pypdf.generic import (
 from pdf_sign import (
     CONTENTS_SIZE,
     SIGNING_STATEMENT,
+    byte_range_digest,
+    embed_signature,
     prepare_pdf_for_signing,
 )
 from share_errors import AlreadySignedError, InvalidPdfError
@@ -22,9 +26,6 @@ from share_errors import AlreadySignedError, InvalidPdfError
 SIGNER = "dummy_user"
 SIGNING_TIME = datetime(2026, 11, 27, 9, 30, 0, tzinfo=timezone.utc)
 PDF_DATE = "D:20261127093000+00'00'"
-
-
-# --- dummy PDFs, built in the test (contract section 10) ---
 
 
 def _to_bytes(writer):
@@ -51,11 +52,6 @@ def make_pdf(pages=1, title=None, header=None):
 
 def make_pdf_with_form(signature_field=None, field_name="Medimo-Signature",
                        indirect=False, sig_flags=None, inherit_type=False):
-    """PDF with an existing AcroForm and one existing field + widget.
-
-    signature_field: None (a text field), "empty" (/Sig without /V),
-    or "filled" (/Sig with /V).
-    """
     writer = _blank_writer()
     page = writer.pages[0]
 
@@ -83,7 +79,6 @@ def make_pdf_with_form(signature_field=None, field_name="Medimo-Signature",
 
     top_ref = field_ref
     if inherit_type:
-        # /FT on the parent only, the kid holds /V (ISO 32000-1 12.7.3.1).
         kid = field_ref.get_object()
         del kid[NameObject("/FT")]
         del kid[NameObject("/T")]
@@ -129,9 +124,6 @@ def find_new_field(prepared):
     raise AssertionError("New signature field not found.")
 
 
-# --- tests ---
-
-
 class ByteLayoutTests(unittest.TestCase):
     def setUp(self):
         self.original = make_pdf()
@@ -146,7 +138,6 @@ class ByteLayoutTests(unittest.TestCase):
         self.assertEqual(zero, 0)
         self.assertGreater(a, len(self.original))
         self.assertLess(a, b)
-        # The second range reaches the end of the file.
         self.assertEqual(b + c, len(self.prepared))
 
     def test_gap_is_exactly_the_contents_placeholder(self):
@@ -175,7 +166,6 @@ class ByteLayoutTests(unittest.TestCase):
         self.assertEqual(appended.count(b"/Contents"), 1)
 
     def test_signature_dict_is_not_in_an_object_stream(self):
-        # The signature dictionary must be readable in the raw bytes.
         appended = self.prepared[len(self.original):]
         self.assertIn(b"/Type /Sig", appended)
         self.assertIn(b"/SubFilter /adbe.pkcs7.detached", appended)
@@ -195,8 +185,6 @@ class SignatureStructureTests(unittest.TestCase):
         self.assertEqual(self.signature["/Type"], "/Sig")
         self.assertEqual(self.signature["/Filter"], "/Adobe.PPKLite")
         self.assertEqual(self.signature["/SubFilter"], "/adbe.pkcs7.detached")
-        # pypdf may decode an all-zero string as UTF-16 text, so compare
-        # the raw bytes. (Verification reads the ByteRange gap, not this.)
         contents = self.signature["/Contents"].original_bytes
         self.assertEqual(contents, b"\x00" * CONTENTS_SIZE)
 
@@ -241,7 +229,6 @@ class SignatureStructureTests(unittest.TestCase):
         self.assertNotIn("/Annots", reader.pages[2])
 
     def test_name_with_pdf_syntax_is_escaped(self):
-        # A name full of PDF delimiters must stay one string value.
         name = "x) /Evil (y\\"
         prepared, _ = prepare(make_pdf(), signer=name)
         _, field = find_new_field(prepared)
@@ -266,7 +253,6 @@ class ExistingFormTests(unittest.TestCase):
         reader = PdfReader(io.BytesIO(prepared))
 
         root = reader.trailer["/Root"]
-        # Still indirect references after the update.
         self.assertTrue(hasattr(root.raw_get("/AcroForm"), "idnum"))
         acroform = root["/AcroForm"]
         self.assertTrue(hasattr(acroform.raw_get("/Fields"), "idnum"))
@@ -383,6 +369,156 @@ class RejectedInputTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     prepare(make_pdf(), signer=value)
+
+
+class ByteRangeDigestTests(unittest.TestCase):
+    def setUp(self):
+        self.prepared, self.byte_range = prepare(make_pdf())
+
+    def test_matches_manual_sha256(self):
+        _, a, b, c = self.byte_range
+        expected = hashlib.sha256(
+            self.prepared[0:a] + self.prepared[b:b + c]
+        ).digest()
+        self.assertEqual(byte_range_digest(self.prepared, self.byte_range), expected)
+
+    def test_digest_is_32_bytes(self):
+        digest = byte_range_digest(self.prepared, self.byte_range)
+        self.assertIsInstance(digest, bytes)
+        self.assertEqual(len(digest), 32)
+
+    def test_byte_outside_gap_changes_digest(self):
+        _, a, b, c = self.byte_range
+        before = byte_range_digest(self.prepared, self.byte_range)
+        for position in (0, a - 1, b, b + c - 1):
+            with self.subTest(position=position):
+                changed = bytearray(self.prepared)
+                changed[position] ^= 0x01
+                self.assertNotEqual(
+                    byte_range_digest(bytes(changed), self.byte_range), before
+                )
+
+    def test_byte_inside_gap_does_not_change_digest(self):
+        _, a, b, _ = self.byte_range
+        before = byte_range_digest(self.prepared, self.byte_range)
+        changed = bytearray(self.prepared)
+        changed[a + 1:b - 1] = b"F" * (b - a - 2)
+        self.assertEqual(byte_range_digest(bytes(changed), self.byte_range), before)
+
+    def test_extra_bytes_after_range_are_allowed(self):
+        before = byte_range_digest(self.prepared, self.byte_range)
+        longer = self.prepared + b"\n% appended later\n"
+        self.assertEqual(byte_range_digest(longer, self.byte_range), before)
+
+    def test_tuple_is_accepted(self):
+        self.assertEqual(
+            byte_range_digest(self.prepared, tuple(self.byte_range)),
+            byte_range_digest(self.prepared, self.byte_range),
+        )
+
+    def test_bad_byte_range_is_rejected(self):
+        _, a, b, c = self.byte_range
+        bad = {
+            "three numbers": [0, a, b],
+            "five numbers": [0, a, b, c, 0],
+            "negative": [0, a, b, -1],
+            "not starting at zero": [1, a, b, c],
+            "empty gap": [0, a, a, c],
+            "gap backwards": [0, b, a, c],
+            "past the end": [0, a, b, c + 1],
+            "bool": [0, a, b, True],
+            "string": [0, a, b, str(c)],
+            "float": [0, a, b, float(c)],
+            "not a list": "0 1 2 3",
+        }
+        for label, value in bad.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    byte_range_digest(self.prepared, value)
+
+    def test_pdf_must_be_bytes(self):
+        with self.assertRaises(ValueError):
+            byte_range_digest(bytearray(self.prepared), self.byte_range)
+
+
+class EmbedSignatureTests(unittest.TestCase):
+    def setUp(self):
+        self.prepared, self.byte_range = prepare(make_pdf())
+        self.cms = os.urandom(2000)
+
+    def test_length_and_outside_bytes_unchanged(self):
+        signed = embed_signature(self.prepared, self.byte_range, self.cms)
+        _, a, b, c = self.byte_range
+        self.assertEqual(len(signed), len(self.prepared))
+        self.assertEqual(signed[:a + 1], self.prepared[:a + 1])
+        self.assertEqual(signed[b - 1:], self.prepared[b - 1:])
+
+    def test_gap_holds_uppercase_hex_then_zeros(self):
+        signed = embed_signature(self.prepared, self.byte_range, self.cms)
+        _, a, b, _ = self.byte_range
+        gap = signed[a + 1:b - 1]
+        cms_hex = self.cms.hex().upper().encode("ascii")
+
+        self.assertEqual(len(gap), 2 * CONTENTS_SIZE)
+        self.assertTrue(gap.startswith(cms_hex))
+        self.assertEqual(gap[len(cms_hex):], b"0" * (len(gap) - len(cms_hex)))
+        self.assertEqual(gap, gap.upper())
+
+    def test_gap_decodes_to_cms_plus_zero_padding(self):
+        signed = embed_signature(self.prepared, self.byte_range, self.cms)
+        _, a, b, _ = self.byte_range
+        decoded = bytes.fromhex(signed[a + 1:b - 1].decode("ascii"))
+        self.assertEqual(len(decoded), CONTENTS_SIZE)
+        self.assertEqual(decoded[:len(self.cms)], self.cms)
+        self.assertEqual(decoded[len(self.cms):], b"\x00" * (CONTENTS_SIZE - len(self.cms)))
+
+    def test_digest_is_the_same_before_and_after(self):
+        before = byte_range_digest(self.prepared, self.byte_range)
+        signed = embed_signature(self.prepared, self.byte_range, self.cms)
+        self.assertEqual(byte_range_digest(signed, self.byte_range), before)
+
+    def test_result_is_still_readable(self):
+        signed = embed_signature(self.prepared, self.byte_range, self.cms)
+        self.assertEqual(len(PdfReader(io.BytesIO(signed)).pages), 1)
+
+    def test_cms_size_limits(self):
+        exact = os.urandom(CONTENTS_SIZE)
+        signed = embed_signature(self.prepared, self.byte_range, exact)
+        _, a, b, _ = self.byte_range
+        self.assertEqual(signed[a + 1:b - 1], exact.hex().upper().encode("ascii"))
+
+        for label, value in (
+            ("too big", os.urandom(CONTENTS_SIZE + 1)),
+            ("empty", b""),
+            ("not bytes", bytearray(self.cms)),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    embed_signature(self.prepared, self.byte_range, value)
+
+    def test_cannot_embed_twice(self):
+        signed = embed_signature(self.prepared, self.byte_range, self.cms)
+        with self.assertRaises(ValueError):
+            embed_signature(signed, self.byte_range, os.urandom(100))
+
+    def test_byte_range_must_point_to_placeholder(self):
+        _, a, b, c = self.byte_range
+        for label, value in (
+            ("shifted", [0, a + 1, b + 1, c - 1]),
+            ("too short", [0, a, b - 2, c + 2]),
+            ("start of file", [0, 1, b, c]),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    embed_signature(self.prepared, value, self.cms)
+
+    def test_bad_byte_range_is_rejected(self):
+        with self.assertRaises(ValueError):
+            embed_signature(self.prepared, [0, 1, 2], self.cms)
+
+    def test_prepared_pdf_must_be_bytes(self):
+        with self.assertRaises(ValueError):
+            embed_signature(bytearray(self.prepared), self.byte_range, self.cms)
 
 
 if __name__ == "__main__":
