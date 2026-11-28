@@ -817,5 +817,270 @@ class TestDerDecoder(unittest.TestCase):
         self.assert_error("malformed", read_tlv, bytes.fromhex("020101"), 0, 2)
 
 
+# Stage 2c: independent wire fixtures and resource boundary tests.
+from der import (
+    validate_tree, MAX_INPUT_SIZE, MAX_ELEMENT_LENGTH, MAX_DEPTH,
+    MAX_CHILDREN, MAX_TOTAL_ELEMENTS, MAX_LENGTH_OCTETS,
+    MAX_TAG_OCTETS, MAX_OID_ARCS, MAX_OID_COMPONENT_OCTETS,
+    MAX_OID_SIZE,
+)
+
+
+class TestDerHardening(unittest.TestCase):
+    def assert_failure(self, kind, reason, fn, *args, **kwargs):
+        with self.assertRaises(DerError) as caught:
+            fn(*args, **kwargs)
+        self.assertEqual(caught.exception.kind, kind)
+        self.assertEqual(caught.exception.reason, reason)
+
+    @staticmethod
+    def wire(tag, content):
+        # Independent fixture helper: no production encoder dependency.
+        size = len(content)
+        if size < 128:
+            length = bytes([size])
+        elif size < 256:
+            length = b"\x81" + bytes([size])
+        else:
+            length = b"\x82" + size.to_bytes(2, "big")
+        return bytes([tag]) + length + content
+
+    def strict(self, raw):
+        return validate_tree(parse_der(raw))
+
+    def resource(self, fn, *args):
+        self.assert_failure("malformed", "resource_limit", fn, *args)
+
+    def test_set_of_wire_order_not_numeric_order(self):
+        raw = bytes.fromhex("310a0201010201ff02020080")
+        children = decode_value(parse_der(raw), 0x31)
+        self.assertEqual(tuple(map(decode_value, children)), (1, -1, 128))
+        self.assertEqual(b"".join(c.raw for c in children), raw[2:])
+        bad = parse_der(bytes.fromhex("3106020102020101"))
+        self.assert_failure("non_der", "canonical", decode_value, bad, 0x31)
+        # SET vs SET OF is not inferred by the generic tree walker.
+        self.assertIs(validate_tree(bad), bad)
+
+    def test_set_of_duplicate_encodings_and_empty(self):
+        raw = bytes.fromhex("3106020101020101")
+        self.assertEqual([x.raw for x in decode_value(parse_der(raw))],
+                         [b"\x02\x01\x01"] * 2)
+        self.assertEqual(decode_value(parse_der(b"\x31\x00")), ())
+
+    def test_implicit_set_of_order_and_raw(self):
+        raw = bytes.fromhex("a006020101020102")
+        node = parse_der(raw)
+        self.assertEqual(tuple(map(decode_value, decode_implicit(node, 0, 0x31))), (1, 2))
+        self.assertEqual(node.raw, raw)
+        bad = parse_der(bytes.fromhex("a006020102020101"))
+        self.assertIs(validate_tree(bad), bad)
+        self.assert_failure("non_der", "canonical", decode_implicit, bad, 0, 0x31)
+        self.assertEqual(tuple(map(decode_value, decode_implicit(bad, 0, 0x30))), (2, 1))
+
+    def test_nested_primitive_validation_and_error_locality(self):
+        for raw, kind, reason in (("3005a003010101", "non_der", "canonical"),
+                                  ("3005a003050100", "malformed", "structural")):
+            node = parse_der(bytes.fromhex(raw))
+            (wrapper,) = decode_children(node)
+            self.assertEqual(wrapper.raw, bytes.fromhex(raw)[2:])
+            self.assert_failure(kind, reason, validate_tree, wrapper)
+
+    def test_nested_trailing_and_truncation(self):
+        for raw in ("30053003050002", "3004a0020201", "300430020000"):
+            self.assert_failure("malformed", "structural", self.strict, bytes.fromhex(raw))
+
+    def test_encoder_rejects_bad_supplied_elements(self):
+        for raw in ("0202ff", "05000500", "300102", "3003050100", "3003010101", "058100"):
+            element = bytes.fromhex(raw)
+            for fn in (lambda v: der_sequence(v), lambda v: der_set_of(v),
+                       lambda v: der_explicit(0, v), lambda v: der_implicit(0, v)):
+                with self.subTest(raw=raw, fn=fn):
+                    with self.assertRaises(ValueError):
+                        fn(element)
+        self.assertEqual(der_explicit(0, bytes.fromhex("3003020101")),
+                         bytes.fromhex("a0053003020101"))
+
+    def test_opaque_implicit_values_are_not_guessed(self):
+        node = parse_der(bytes.fromhex("800101"))
+        self.assertIs(validate_tree(node), node)
+        self.assertEqual(decode_implicit(node, 0, 0x02), 1)
+        self.assert_failure("non_der", "canonical", decode_implicit, node, 0, 0x01)
+        octets = parse_der(bytes.fromhex("040202ff"))
+        self.assertIs(validate_tree(octets), octets)  # not nested DER by default
+
+    def test_explicit_single_child_canonical_content(self):
+        wrapper = parse_der(bytes.fromhex("a00402020001"))
+        child = decode_explicit(wrapper, 0)
+        self.assert_failure("malformed", "structural", decode_value, child, 0x02)
+        self.assert_failure("malformed", "structural", validate_tree, wrapper)
+
+    def test_additional_universal_tag_forms(self):
+        for raw in ("2a00", "0900", "0800", "0b00", "1d00"):
+            if raw == "0900":  # REAL zero; opaque but structurally permitted
+                self.assertEqual(parse_der(bytes.fromhex(raw)).raw, bytes.fromhex(raw))
+                continue
+            self.assert_failure("malformed", "structural", parse_der, bytes.fromhex(raw))
+        for raw in ("3600", "3e00", "3300", "2300"):
+            self.assert_failure("non_der", "canonical", parse_der, bytes.fromhex(raw))
+
+    def test_constructed_context_and_private_tags_not_inferred(self):
+        for raw in ("a0020500", "e0020500", "60020500"):
+            node = self.strict(bytes.fromhex(raw))
+            self.assertTrue(node.constructed)
+            self.assertEqual(decode_children(node)[0].raw, b"\x05\x00")
+
+    def test_unsupported_typed_encoding_reason(self):
+        for raw in ("160178", "9f81000178"):
+            node = parse_der(bytes.fromhex(raw))
+            self.assert_failure("malformed", "unsupported", decode_value, node)
+        self.assert_failure("non_der", "canonical", parse_der, b"\x30\x80")
+
+    def test_more_invalid_utf8_and_printable(self):
+        for raw in ("0c02c080", "0c03eda080", "0c04f4908080", "0c02e282", "13017f", "1301ff"):
+            self.assert_failure("malformed", "structural", self.strict, bytes.fromhex(raw))
+
+    def test_more_time_boundaries(self):
+        valid = self.strict(self.wire(0x18, b"20000229000000Z"))
+        self.assertEqual(decode_value(valid), datetime(2000, 2, 29, tzinfo=timezone.utc))
+        for tag, text in ((0x18, b"21000229000000Z"), (0x17, b"261231235960Z"),
+                          (0x18, b"20500101240000Z"), (0x17, b"261128000000z"),
+                          (0x18, b"20500101000000.Z")):
+            self.assert_failure("malformed", "structural", self.strict, self.wire(tag, text))
+        for text in (b"2050010100Z", b"20500101000000+07", b"20500101000000.0Z"):
+            self.assert_failure("non_der", "canonical", self.strict, self.wire(0x18, text))
+
+    def test_canonical_fractional_generalized_time(self):
+        for text in (b"20500101000000.5Z", b"20500101000000.1234567Z"):
+            raw = self.wire(0x18, text)
+            node = self.strict(raw)
+            self.assertEqual(node.raw, raw)
+            self.assert_failure("malformed", "unsupported", decode_value, node)
+        node = parse_der(self.wire(0x18, b"20500101000000.123456Z"))
+        self.assertEqual(decode_value(node, allow_fractional=True),
+                         datetime(2050, 1, 1, microsecond=123456, tzinfo=timezone.utc))
+        node = parse_der(self.wire(0x18, b"20500101000000.1234567Z"))
+        self.assert_failure("malformed", "unsupported", decode_value, node, allow_fractional=True)
+        node = parse_der(self.wire(0x80, b"20500101000000.5Z"))
+        self.assertEqual(decode_implicit(node, 0, 0x18, allow_fractional=True).microsecond, 500000)
+
+    def test_unsupported_calendar_representation(self):
+        for text in (b"00000101000000Z", b"20161231235960Z"):
+            self.assert_failure("malformed", "unsupported", self.strict, self.wire(0x18, text))
+        self.assert_failure("malformed", "structural", self.strict,
+                            self.wire(0x18, b"20161231125960Z"))
+
+    def test_unsupported_schema_tag_reason(self):
+        node = parse_der(bytes.fromhex("9f81000178"))
+        self.assert_failure("malformed", "unsupported", decode_explicit, node, 128)
+        self.assert_failure("malformed", "unsupported", decode_implicit, node, 128, 0x04)
+        self.assert_failure("malformed", "unsupported", decode_implicit,
+                            parse_der(bytes.fromhex("800178")), 0, 0x16)
+
+    def test_input_size_limit(self):
+        # read_tlv parses one TLV in a bounded buffer, not the entire stream.
+        data = b"\x05\x00" + b"\x00" * (MAX_INPUT_SIZE - 2)
+        element, end = read_tlv(data, 0, 2)
+        self.assertEqual((element.raw, end), (b"\x05\x00", 2))
+        self.resource(read_tlv, data + b"\x00", 0, 2)
+
+    def test_element_length_limit(self):
+        data = b"x" * MAX_ELEMENT_LENGTH
+        node = self.strict(self.wire(0x04, data))
+        self.assertEqual(node.value, data)
+        self.resource(parse_der, self.wire(0x04, data + b"x"))
+        self.assert_failure("malformed", "structural", parse_der, b"\x04\x82\xff\xff")
+
+    def test_length_octet_limit(self):
+        at = bytes([0x04, 0x80 | MAX_LENGTH_OCTETS]) + b"\x00" * (MAX_LENGTH_OCTETS - 1) + b"\x01x"
+        self.assert_failure("non_der", "canonical", parse_der, at)
+        above = bytes([0x04, 0x80 | (MAX_LENGTH_OCTETS + 1)]) + b"\x00" * MAX_LENGTH_OCTETS + b"\x01x"
+        self.resource(parse_der, above)
+        self.assert_failure("malformed", "structural", parse_der, above[:3])
+        self.resource(parse_der, b"\x04\xfe" + b"\x00" * 126)
+
+    def test_high_tag_octet_limit(self):
+        at = b"\x9f\x81" + b"\x80" * (MAX_TAG_OCTETS - 2) + b"\x00\x00"
+        node = parse_der(at)
+        self.assertEqual(node.raw, at)
+        self.assertEqual(node.tag_number, 1 << (7 * (MAX_TAG_OCTETS - 1)))
+        above = b"\x9f\x81" + b"\x80" * (MAX_TAG_OCTETS - 1) + b"\x00\x00"
+        self.resource(parse_der, above)
+
+    def nested(self, depth):
+        raw = b"\x05\x00"
+        for _ in range(depth - 1):
+            raw = self.wire(0x30, raw)
+        return raw
+
+    def test_nesting_depth_limit(self):
+        root = self.strict(self.nested(MAX_DEPTH))
+        current = root
+        for _ in range(MAX_DEPTH - 1):
+            current, = decode_children(current)
+        self.assertEqual(current.depth, MAX_DEPTH)
+        self.assertEqual(current.raw, b"\x05\x00")
+        self.resource(self.strict, self.nested(MAX_DEPTH + 1))
+
+    def test_child_count_limit(self):
+        raw = self.wire(0x30, b"\x05\x00" * MAX_CHILDREN)
+        node = self.strict(raw)
+        self.assertEqual(len(decode_children(node)), MAX_CHILDREN)
+        self.resource(decode_children, parse_der(self.wire(0x30, b"\x05\x00" * (MAX_CHILDREN + 1))))
+
+    def tree_with_count(self, count):
+        # One root + groups with at most MAX_CHILDREN leaf nodes per group.
+        remaining = count - 1
+        groups = []
+        while remaining:
+            group_size = min(remaining, MAX_CHILDREN + 1)
+            groups.append(self.wire(0x30, b"\x05\x00" * (group_size - 1)))
+            remaining -= group_size
+        return self.wire(0x30, b"".join(groups))
+
+    def test_total_elements_limit_and_repeat_reads(self):
+        root = self.strict(self.tree_with_count(MAX_TOTAL_ELEMENTS))
+        self.assertIs(validate_tree(root), root)  # repeat visits are not double counted
+        self.resource(self.strict, self.tree_with_count(MAX_TOTAL_ELEMENTS + 1))
+
+    def test_total_elements_shared_across_lazy_branches(self):
+        root = parse_der(self.tree_with_count(MAX_TOTAL_ELEMENTS + 1))
+        groups = decode_children(root)
+        for group in groups[:-1]:
+            decode_children(group)
+        self.resource(decode_children, groups[-1])
+
+    def test_oid_component_limit(self):
+        component = b"\x81" + b"\x80" * (MAX_OID_COMPONENT_OCTETS - 2) + b"\x00"
+        raw = self.wire(0x06, b"\x2a" + component)
+        self.assertEqual(decode_value(self.strict(raw)), "1.2." + str(1 << (7 * (MAX_OID_COMPONENT_OCTETS - 1))))
+        self.resource(self.strict, self.wire(0x06, b"\x2a\x81" + b"\x80" * (MAX_OID_COMPONENT_OCTETS - 1) + b"\x00"))
+        self.resource(self.strict, self.wire(0x06, b"\x2a\x81" + b"\x80" * MAX_OID_COMPONENT_OCTETS))
+
+    def test_oid_arc_count_limit(self):
+        raw = self.wire(0x06, b"\x2a" + b"\x01" * (MAX_OID_ARCS - 2))
+        self.assertEqual(len(decode_value(self.strict(raw)).split(".")), MAX_OID_ARCS)
+        self.resource(self.strict, self.wire(0x06, b"\x2a" + b"\x01" * (MAX_OID_ARCS - 1)))
+
+    def test_oid_content_size_limit(self):
+        component = b"\x81" + b"\x80" * (MAX_OID_COMPONENT_OCTETS - 2) + b"\x00"
+        whole, rest = divmod(MAX_OID_SIZE, len(component))
+        content = component * whole
+        if rest:
+            content += b"\x01" if rest == 1 else b"\x81" + b"\x80" * (rest - 2) + b"\x00"
+        self.assertEqual(len(content), MAX_OID_SIZE)
+        self.assertEqual(self.strict(self.wire(0x06, content)).value, content)
+        self.resource(self.strict, self.wire(0x06, content + b"\x01"))
+
+    def test_medimo_slot_size_and_raw_preservation(self):
+        # Synthetic full-size DER element, not a CMS implementation.
+        raw = b"\x30\x82\x1f\xfc\x04\x82\x1f\xf8" + b"x" * 8184
+        self.assertEqual(len(raw), 8192)
+        node = self.strict(raw)
+        child, = decode_children(node)
+        self.assertEqual(child.raw, raw[4:])
+        self.assertEqual(node.raw, raw)
+        self.assertEqual(raw[child.start:child.end], child.raw)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,8 @@
-"""Minimal DER encoder for Medimo's X.509 and CMS profiles."""
+"""Bounded DER encoder and decoder for Medimo's X.509 and CMS profiles."""
 
 import re
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 
 _PRINTABLE_CHARS = frozenset(
@@ -241,17 +242,11 @@ def der_generalized_time(value):
 
 
 def _encoded_element(element):
-    # Only accepts trusted TLVs produced by the encoder.
-    # Full structural validation belongs to the decoder.
+    # Validate the complete supplied TLV and its visible constructed tree.
+    # Opaque primitive content and schema-specific rules remain caller-owned.
     _require_bytes(element)
-
-    if len(element) < 2:
-        raise ValueError(
-            "Expected an encoded DER element"
-        )
-
+    validate_tree(parse_der(element))
     _check_tag(element[0])
-
     return element
 
 
@@ -308,18 +303,45 @@ def der_implicit(number, element):
     return bytes([tag]) + element[1:]
 
 # --- DER decoder ---
-from dataclasses import dataclass
-from datetime import timezone
+# Application limits, not ASN.1/DER limits. The CMS slot is 8192 bytes.
+MAX_INPUT_SIZE = 32768
+MAX_ELEMENT_LENGTH = 16384
+MAX_DEPTH = 32  # root is depth 1
+MAX_CHILDREN = 128
+MAX_TOTAL_ELEMENTS = 1024  # includes the root
+MAX_LENGTH_OCTETS = 4
+MAX_TAG_OCTETS = 5  # base-128 groups after the initial identifier octet
+MAX_OID_ARCS = 32  # includes the two arcs represented by first subidentifier
+MAX_OID_COMPONENT_OCTETS = 10
+MAX_OID_SIZE = 256
+
+
+@dataclass
+class _ParseBudget:
+    # Count unique input spans, so re-reading a child does not spend budget.
+    seen: set = field(default_factory=set)
+
+    def register(self, start, end):
+        span = (start, end)
+        if span not in self.seen:
+            if len(self.seen) >= MAX_TOTAL_ELEMENTS:
+                raise _resource("Too many DER elements")
+            self.seen.add(span)
 
 
 class DerError(ValueError):
-    """Decoder error: malformed input or an identified non-DER encoding."""
+    """Two contract kinds; reason distinguishes local policy rejection.
 
-    def __init__(self, kind, message):
+    non_der identifies a DER rule violation, not proof of complete valid BER.
+    malformed also carries unsupported/resource_limit reasons for compatibility.
+    """
+
+    def __init__(self, kind, message, *, reason=None):
         if kind not in ("malformed", "non_der"):
             raise ValueError("Unknown DerError kind")
         super().__init__(message)
         self.kind = kind
+        self.reason = reason or ("canonical" if kind == "non_der" else "structural")
 
 
 @dataclass(frozen=True)
@@ -335,6 +357,8 @@ class DerElement:
     start: int
     value_start: int
     end: int                 # exclusive; offsets relative to original input
+    depth: int = field(default=1, compare=False, repr=False)
+    _budget: _ParseBudget = field(default_factory=_ParseBudget, compare=False, repr=False)
 
 
 def _malformed(message):
@@ -345,7 +369,25 @@ def _non_der(message):
     return DerError("non_der", message)
 
 
-def _read_tlv(data, offset, limit, base=0):
+def _resource(message):
+    return DerError("malformed", message, reason="resource_limit")
+
+
+def _unsupported(message):
+    return DerError("malformed", message, reason="unsupported")
+
+
+# Known universal tag forms; unrecognized tags remain opaque at TLV level.
+_PRIMITIVE_ONLY = frozenset({1, 2, 5, 6, 9, 10, 13, 14, 31, 32, 33, 34, 35, 36})
+_CONSTRUCTED_ONLY = frozenset({8, 11, 16, 17, 29})
+_DER_PRIMITIVE_STRINGS = frozenset({3, 4, 7, 12, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30})
+
+
+def _read_tlv(data, offset, limit, base=0, *, depth=1, budget=None):
+    if depth > MAX_DEPTH:
+        raise _resource("DER nesting depth exceeded")
+    if budget is None:
+        budget = _ParseBudget()
     start = offset
     if offset >= limit:
         raise _malformed("Missing tag")
@@ -361,6 +403,7 @@ def _read_tlv(data, offset, limit, base=0):
     if number == 31:
         number = 0
         first_group = True
+        groups = 0
         while True:
             if offset >= limit:
                 raise _malformed("Truncated high-tag-number identifier")
@@ -368,6 +411,9 @@ def _read_tlv(data, offset, limit, base=0):
             offset += 1
             if first_group and (octet & 0x7f) == 0:
                 raise _malformed("Non-minimal high-tag-number identifier")
+            groups += 1
+            if groups > MAX_TAG_OCTETS:
+                raise _resource("High-tag-number identifier too long")
             first_group = False
             number = (number << 7) | (octet & 0x7f)
             if not octet & 0x80:
@@ -380,8 +426,8 @@ def _read_tlv(data, offset, limit, base=0):
         raise _malformed("Unexpected EOC or reserved universal tag")
 
     if tag_class == 0 and (
-        (number in (1, 2, 5, 6) and constructed)
-        or (number in (16, 17) and not constructed)
+        (number in _PRIMITIVE_ONLY and constructed)
+        or (number in _CONSTRUCTED_ONLY and not constructed)
     ):
         raise _malformed("Invalid primitive/constructed form for ASN.1 type")
 
@@ -404,6 +450,8 @@ def _read_tlv(data, offset, limit, base=0):
         count = first_length & 0x7f
         if count > limit - offset:
             raise _malformed("Truncated long-form length")
+        if count > MAX_LENGTH_OCTETS:
+            raise _resource("Too many length octets")
         encoded_length = data[offset:offset + count]
         offset += count
         length = int.from_bytes(encoded_length, "big")
@@ -411,13 +459,16 @@ def _read_tlv(data, offset, limit, base=0):
 
     if length > limit - offset:
         raise _malformed("Value exceeds enclosing boundary")
+    if length > MAX_ELEMENT_LENGTH:
+        raise _resource("DER element content too large")
     if non_minimal:
         raise _non_der("Non-minimal length encoding")
 
-    if tag_class == 0 and number in (3, 4, 12, 19, 23, 24) and constructed:
+    if tag_class == 0 and number in _DER_PRIMITIVE_STRINGS and constructed:
         raise _non_der("Constructed string encoding is not DER")
 
     end = offset + length
+    budget.register(base + start, base + end)
     element = DerElement(
         tag=int.from_bytes(identifier, "big"),
         identifier=identifier,
@@ -430,6 +481,8 @@ def _read_tlv(data, offset, limit, base=0):
         start=base + start,
         value_start=base + offset,
         end=base + end,
+        depth=depth,
+        _budget=budget,
     )
     return element, end
 
@@ -438,6 +491,8 @@ def read_tlv(data, offset=0, end=None):
     """Read one TLV within [offset, end); return (element, next_offset)."""
     if not isinstance(data, bytes):
         raise _malformed("DER input must be bytes")
+    if len(data) > MAX_INPUT_SIZE:
+        raise _resource("DER input too large")
     if end is None:
         end = len(data)
     if (type(offset) is not int or type(end) is not int
@@ -461,8 +516,11 @@ def decode_children(element):
     children = []
     offset = 0
     while offset < element.length:
+        if len(children) >= MAX_CHILDREN:
+            raise _resource("Too many children in DER element")
         child, offset = _read_tlv(
-            element.value, offset, element.length, element.value_start
+            element.value, offset, element.length, element.value_start,
+            depth=element.depth + 1, budget=element._budget,
         )
         children.append(child)
     return tuple(children)
@@ -471,18 +529,27 @@ def decode_children(element):
 def _decode_oid(value):
     if not value:
         raise _malformed("Empty OBJECT IDENTIFIER")
+    if len(value) > MAX_OID_SIZE:
+        raise _resource("OBJECT IDENTIFIER content too large")
     arcs = []
     number = 0
+    groups = 0
     at_start = True
     for octet in value:
         if at_start and octet == 0x80:
             # Minimal subidentifier encoding is required even by BER.
             raise _malformed("Non-minimal OID subidentifier")
+        groups += 1
+        if groups > MAX_OID_COMPONENT_OCTETS:
+            raise _resource("OID subidentifier too large")
         number = (number << 7) | (octet & 0x7f)
         at_start = False
         if not octet & 0x80:
+            if len(arcs) >= MAX_OID_ARCS - 1:
+                raise _resource("Too many OID arcs")
             arcs.append(number)
             number = 0
+            groups = 0
             at_start = True
     if not at_start:
         raise _malformed("Truncated OID subidentifier")
@@ -499,14 +566,14 @@ def _decode_oid(value):
         raise _malformed("OID cannot be represented as decimal") from exc
 
 
-def _decode_time(value, tag):
+def _decode_time(value, tag, *, validate_only=False, allow_fractional=False):
     # Parse common BER time forms to distinguish non-DER from malformed
     # calendar values. The typed Medimo profile accepts whole seconds only.
     if tag == 0x17:
         match = re.fullmatch(rb"([0-9]{2})([0-9]{8})([0-9]{2})?(Z|[+-][0-9]{4})", value)
     else:
         match = re.fullmatch(
-            rb"([0-9]{4})([0-9]{6})([0-9]{2})?([0-9]{2})?([.,][0-9]+)?(Z|[+-][0-9]{4})?",
+            rb"([0-9]{4})([0-9]{6})([0-9]{2})?([0-9]{2})?([.,][0-9]+)?(Z|[+-][0-9]{2}(?:[0-9]{2})?)?",
             value,
         )
     if match is None:
@@ -528,22 +595,38 @@ def _decode_time(value, tag):
         second = int(seconds or b"00")
         full_precision = minutes is not None and seconds is not None
 
+    # Python datetime cannot represent ISO year zero or a leap second.
+    # Do not silently normalize either. UTCTime seconds are strictly 00-59.
+    unusual_year = tag == 0x18 and year == 0
+    leap_second = tag == 0x18 and second == 60
     try:
-        result = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        result = datetime(400 if unusual_year else year, month, day, hour,
+                          minute, 59 if leap_second else second, tzinfo=timezone.utc)
         if zone not in (None, b"Z"):
-            if int(zone[1:3]) > 23 or int(zone[3:5]) > 59:
+            if int(zone[1:3]) > 23 or int(zone[3:5] or b"00") > 59:
                 raise ValueError("Invalid time offset")
     except ValueError as exc:
         raise _malformed("Invalid calendar time") from exc
 
     if zone != b"Z" or not full_precision:
         raise _non_der("Time must include seconds and use UTC Z notation")
+    if fraction is not None and (fraction.startswith(b",") or fraction.endswith(b"0")):
+        raise _non_der("Non-canonical GeneralizedTime fraction")
+    if leap_second and (hour, minute) != (23, 59):
+        raise _malformed("Invalid UTC leap-second position")
+    if unusual_year or leap_second:
+        raise _unsupported("Calendar value outside supported datetime representation")
     if fraction is not None:
-        if fraction.startswith(b",") or fraction.endswith(b"0"):
-            raise _non_der("Non-canonical GeneralizedTime fraction")
-        # A canonical fractional GeneralizedTime may be valid general DER,
-        # but is outside RFC 5280 / RFC 5652's whole-second time profile.
-        raise _malformed("Fractional seconds outside Medimo time profile")
+        # DER permits canonical fractions of arbitrary precision. Validate
+        # the lexical form without converting or rounding it in tree checks.
+        if validate_only:
+            return None
+        if not allow_fractional:
+            raise _unsupported("Fractional seconds outside legacy time profile")
+        digits = fraction[1:]
+        if len(digits) > 6:
+            raise _unsupported("Fraction exceeds datetime precision; use raw value")
+        return result.replace(microsecond=int(digits.ljust(6, b"0")))
     return result
 
 
@@ -553,11 +636,13 @@ _SUPPORTED_TAGS = frozenset({
 })
 
 
-def _decode_as(element, tag):
+def _decode_as(element, tag, *, allow_fractional=False):
     value = element.value
     if tag in (0x30, 0x31):
-        # SET OF ordering is validated in Stage 2c, with schema context.
-        return decode_children(element)
+        children = decode_children(element)
+        if tag == 0x31:
+            _check_set_of_order(children)
+        return children
     if tag == 0x01:
         if len(value) != 1:
             raise _malformed("BOOLEAN requires one content octet")
@@ -599,29 +684,36 @@ def _decode_as(element, tag):
             raise _malformed("Invalid PrintableString character")
         return text
     if tag in (0x17, 0x18):
-        return _decode_time(value, tag)
-    raise _malformed("No typed decoder for this tag")
+        return _decode_time(value, tag, allow_fractional=allow_fractional)
+    raise _unsupported("No typed decoder for this tag")
 
 
-def decode_value(element, expected_tag=None):
-    """Decode a supported universal type; return children for containers."""
+def decode_value(element, expected_tag=None, *, allow_fractional=False):
+    """Decode a supported universal type; 0x31 means SET OF in this API.
+
+    Whole-second time remains the default for Stage 2b compatibility.
+    allow_fractional=True enables exact datetime fractions up to six digits.
+    """
     if not isinstance(element, DerElement):
         raise _malformed("Expected a DerElement")
     tag = element.tag if expected_tag is None else expected_tag
     if type(tag) is not int or tag not in _SUPPORTED_TAGS:
-        raise _malformed("Unsupported typed decoder tag")
+        raise _unsupported("Unsupported typed decoder tag")
     if element.tag != tag:
         # Constructed string encodings can be BER but are forbidden in DER.
         if tag in (0x03, 0x04, 0x0c, 0x13, 0x17, 0x18) and element.tag == tag | 0x20:
             raise _non_der("Constructed string encoding is not DER")
         raise _malformed("Unexpected ASN.1 tag")
-    return _decode_as(element, tag)
+    return _decode_as(element, tag, allow_fractional=allow_fractional)
 
 
 def decode_explicit(element, number):
     """Return the one child of an explicitly tagged context wrapper."""
-    if (not isinstance(element, DerElement) or type(number) is not int
-            or not 0 <= number <= 30 or element.tag != (0xa0 | number)):
+    if not isinstance(element, DerElement) or type(number) is not int or number < 0:
+        raise _malformed("Invalid explicit context tag request")
+    if number > 30:
+        raise _unsupported("High-number explicit context tags are not supported")
+    if element.tag != (0xa0 | number):
         raise _malformed("Unexpected explicit context tag")
     children = decode_children(element)
     if len(children) != 1:
@@ -629,16 +721,46 @@ def decode_explicit(element, number):
     return children[0]
 
 
-def decode_implicit(element, number, universal_tag):
+def decode_implicit(element, number, universal_tag, *, allow_fractional=False):
     """Interpret context-tagged content using a caller-supplied schema tag."""
     if (not isinstance(element, DerElement) or type(number) is not int
-            or not 0 <= number <= 30 or type(universal_tag) is not int
-            or universal_tag not in _SUPPORTED_TAGS):
-        raise _malformed("Unsupported implicit tag or schema type")
+            or number < 0 or type(universal_tag) is not int):
+        raise _malformed("Invalid implicit context tag request")
+    if number > 30 or universal_tag not in _SUPPORTED_TAGS:
+        raise _unsupported("Unsupported implicit tag or schema type")
     expected = 0x80 | (universal_tag & 0x20) | number
     if element.tag != expected:
         if universal_tag in (0x03, 0x04, 0x0c, 0x13, 0x17, 0x18) and element.tag == (expected | 0x20):
             raise _non_der("Constructed implicit string encoding is not DER")
         raise _malformed("Unexpected implicit context tag")
     # No reconstructed TLV: preserve the original element and raw bytes.
-    return _decode_as(element, universal_tag)
+    return _decode_as(element, universal_tag, allow_fractional=allow_fractional)
+
+
+def _check_set_of_order(children):
+    # Complete canonical TLVs cannot be proper prefixes of one another.
+    # Thus ordinary bytes ordering is sufficient for X.690 11.6.
+    if any(a.raw > b.raw for a, b in zip(children, children[1:])):
+        raise _non_der("SET OF elements are not in canonical order")
+
+
+def validate_tree(element):
+    """Validate every visible TLV and supported universal primitive.
+
+    Does not infer SET vs SET OF, implicit types, or encapsulated DER from
+    opaque values. Call on each schema-defined subtree at the proper layer.
+    Returns the original element; no bytes are re-encoded.
+    """
+    if not isinstance(element, DerElement):
+        raise _malformed("Expected a DerElement")
+    stack = [element]
+    while stack:
+        current = stack.pop()
+        if current.constructed:
+            stack.extend(reversed(decode_children(current)))
+        elif current.tag_class == 0 and current.tag in _SUPPORTED_TAGS:
+            if current.tag in (0x17, 0x18):
+                _decode_time(current.value, current.tag, validate_only=True)
+            else:
+                _decode_as(current, current.tag)
+    return element
