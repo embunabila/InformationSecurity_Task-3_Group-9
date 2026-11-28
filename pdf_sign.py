@@ -3,7 +3,7 @@
 import hmac
 import io
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from Crypto.Hash import SHA256
 from pypdf import PdfReader, PdfWriter
@@ -17,7 +17,7 @@ from pypdf.generic import (
     TextStringObject,
 )
 
-from share_errors import AlreadySignedError, InvalidPdfError
+from share_errors import AlreadySignedError, InvalidPdfError, KeyExpiredError
 
 
 SIGNING_STATEMENT = (
@@ -418,3 +418,56 @@ def embed_signature(prepared_pdf, byte_range, cms_der):
         raise RuntimeError("Embedding changed bytes outside /Contents.")
 
     return signed_pdf
+
+
+# --- signing ---
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _parse_expires_at(value):
+    try:
+        expires_at = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise ValueError("Stored expires_at is not a valid timestamp.") from None
+
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    return expires_at.astimezone(timezone.utc)
+
+
+def sign_pdf(pdf_bytes, user_id, password):
+    """Sign a PDF with the user's signing key and return the signed PDF."""
+    # Imported here so this module still loads before Della's modules exist,
+    # the same pattern as grant_routes.py.
+    from cms import build_cms_signed_data
+    from db import get_user_by_id
+    from signing_keys import get_signing_key, unlock_signing_key
+
+    signing_key = get_signing_key(user_id)
+    if signing_key is None:
+        raise ValueError("The user has no signing key.")
+
+    user = get_user_by_id(user_id)
+    if user is None:
+        raise ValueError("The user does not exist.")
+
+    now = _utc_now().replace(microsecond=0)
+
+    if now > _parse_expires_at(signing_key["expires_at"]):
+        raise KeyExpiredError("The signing key has expired.")
+
+    private_key = unlock_signing_key(user_id, password)
+
+    prepared, byte_range = prepare_pdf_for_signing(
+        pdf_bytes, user["username"], now
+    )
+    digest = byte_range_digest(prepared, byte_range)
+    cms_der = build_cms_signed_data(
+        digest, signing_key["certificate_der"], private_key, now
+    )
+
+    return embed_signature(prepared, byte_range, cms_der)
