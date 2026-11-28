@@ -576,5 +576,246 @@ class TestDerEncoder(unittest.TestCase):
                 function(0, b"")
 
 
+# --- DER decoder tests ---
+from der import (
+    DerElement, DerError, read_tlv, parse_der, decode_children,
+    decode_value, decode_explicit, decode_implicit,
+)
+
+
+class TestDerDecoder(unittest.TestCase):
+    def assert_error(self, kind, function, *args):
+        with self.assertRaises(DerError) as caught:
+            function(*args)
+        self.assertEqual(caught.exception.kind, kind)
+
+    def test_known_tlv_and_raw_bytes(self):
+        raw = bytes.fromhex("02020080")
+        element = parse_der(raw)
+        self.assertIsInstance(element, DerElement)
+        self.assertEqual(element.tag, 0x02)
+        self.assertEqual(element.identifier, b"\x02")
+        self.assertEqual(element.tag_class, 0)
+        self.assertEqual(element.tag_number, 2)
+        self.assertFalse(element.constructed)
+        self.assertEqual(element.length, 2)
+        self.assertEqual(element.value, b"\x00\x80")
+        self.assertEqual(element.raw, raw)
+        self.assertEqual((element.start, element.value_start, element.end), (0, 2, 4))
+
+    def test_read_tlv_cursor(self):
+        data = bytes.fromhex("0500020101")
+        first, offset = read_tlv(data)
+        second, end = read_tlv(data, offset)
+        self.assertEqual(first.raw, bytes.fromhex("0500"))
+        self.assertEqual(second.raw, bytes.fromhex("020101"))
+        self.assertEqual((offset, end), (2, 5))
+        self.assertEqual(second.start, 2)
+
+    def test_length_boundaries(self):
+        for size, header in ((0, "0400"), (127, "047f"), (128, "048180"),
+                             (255, "0481ff"), (256, "04820100")):
+            with self.subTest(size=size):
+                raw = bytes.fromhex(header) + b"x" * size
+                element = parse_der(raw)
+                self.assertEqual(element.length, size)
+                self.assertEqual(element.raw, raw)
+                self.assertEqual(decode_value(element), b"x" * size)
+
+    def test_known_integer_values(self):
+        for raw, value in (("020100", 0), ("02017f", 127), ("02020080", 128),
+                           ("02020100", 256), ("0201ff", -1), ("020180", -128),
+                           ("0202ff7f", -129)):
+            with self.subTest(raw=raw):
+                self.assertEqual(decode_value(parse_der(bytes.fromhex(raw)), 0x02), value)
+
+    def test_known_boolean_null_octets(self):
+        self.assertIs(decode_value(parse_der(bytes.fromhex("0101ff"))), True)
+        self.assertIs(decode_value(parse_der(bytes.fromhex("010100"))), False)
+        self.assertIsNone(decode_value(parse_der(bytes.fromhex("0500"))))
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("040200ff"))), b"\x00\xff")
+
+    def test_known_bit_strings(self):
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("030206c0"))), (b"\xc0", 6))
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("030100"))), (b"", 0))
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("030300c000"))), (b"\xc0\x00", 0))
+
+    def test_known_oid_values(self):
+        for raw, oid in (("06092a864886f70d010101", "1.2.840.113549.1.1.1"),
+                         ("0609608648016503040201", "2.16.840.1.101.3.4.2.1"),
+                         ("060100", "0.0"), ("06014f", "1.39"),
+                         ("06028100", "2.48"), ("0603883703", "2.999.3")):
+            with self.subTest(oid=oid):
+                self.assertEqual(decode_value(parse_der(bytes.fromhex(raw))), oid)
+
+    def test_known_strings(self):
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("0c03c3a95f"))), "é_")
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("130541202b2042"))), "A + B")
+
+    def test_known_times_and_century_boundary(self):
+        for year, text in ((1950, b"500101000000Z"), (1968, b"680101000000Z"),
+                           (2000, b"000101000000Z"), (2049, b"490101000000Z")):
+            with self.subTest(year=year):
+                self.assertEqual(decode_value(parse_der(b"\x17\x0d" + text)),
+                                 datetime(year, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual(decode_value(parse_der(b"\x18\x0f20500101000000Z")),
+                         datetime(2050, 1, 1, tzinfo=timezone.utc))
+
+    def test_primitive_round_trips(self):
+        moment = datetime(2028, 2, 29, 12, 34, 56, tzinfo=timezone.utc)
+        cases = ((der_integer(1 << 3071), 1 << 3071),
+                 (der_integer(-32769), -32769), (der_boolean(False), False),
+                 (der_bit_string(b"\xc0", 6), (b"\xc0", 6)),
+                 (der_octet_string(b"abc"), b"abc"), (der_null(), None),
+                 (der_oid("2.999.3.16384"), "2.999.3.16384"),
+                 (der_utf8_string("Medimo_é"), "Medimo_é"),
+                 (der_printable_string("A + B"), "A + B"),
+                 (der_utc_time(moment), moment), (der_generalized_time(moment), moment))
+        for raw, expected in cases:
+            with self.subTest(raw=raw[:12]):
+                self.assertEqual(decode_value(parse_der(raw)), expected)
+
+    def test_nested_sequence_and_exact_child_offsets(self):
+        raw = bytes.fromhex("30083003020102020101")
+        outer = parse_der(raw)
+        inner, sibling = decode_value(outer, 0x30)
+        (integer,) = decode_children(inner)
+        self.assertEqual(inner.raw, bytes.fromhex("3003020102"))
+        self.assertEqual(integer.raw, bytes.fromhex("020102"))
+        self.assertEqual((integer.start, integer.value_start, integer.end), (4, 6, 7))
+        self.assertEqual(sibling.raw, raw[7:10])
+        self.assertEqual(decode_value(integer), 2)
+        self.assertEqual(decode_value(sibling), 1)
+        for element in (outer, inner, integer, sibling):
+            self.assertEqual(element.raw, raw[element.start:element.end])
+
+    def test_sequence_and_set_of_round_trip(self):
+        raw = der_sequence(der_set_of(der_integer(2), der_integer(1)), der_null())
+        elements = decode_value(parse_der(raw))
+        self.assertEqual(tuple(map(decode_value, decode_value(elements[0]))), (1, 2))
+        self.assertIsNone(decode_value(elements[1]))
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("3000"))), ())
+        self.assertEqual(decode_value(parse_der(bytes.fromhex("3100"))), ())
+
+    def test_explicit_tag(self):
+        wrapper = parse_der(bytes.fromhex("a003020102"))
+        child = decode_explicit(wrapper, 0)
+        self.assertEqual(child.raw, bytes.fromhex("020102"))
+        self.assertEqual(decode_value(child), 2)
+        self.assertEqual(wrapper.raw, bytes.fromhex("a003020102"))
+
+    def test_implicit_primitive(self):
+        element = parse_der(bytes.fromhex("820178"))
+        self.assertEqual((element.tag_class, element.tag_number, element.constructed), (2, 2, False))
+        self.assertEqual(decode_implicit(element, 2, 0x04), b"x")
+        self.assertEqual(element.raw, bytes.fromhex("820178"))
+
+    def test_implicit_constructed_and_signed_attrs_bytes(self):
+        raw = bytes.fromhex("a006020101020102")
+        element = parse_der(raw)
+        children = decode_implicit(element, 0, 0x31)
+        self.assertEqual(tuple(map(decode_value, children)), (1, 2))
+        self.assertEqual(element.raw, raw)
+        self.assertEqual(b"\x31" + element.raw[1:], bytes.fromhex("3106020101020102"))
+        self.assert_error("malformed", decode_explicit, element, 0)
+
+    def test_implicit_long_form_length_raw(self):
+        raw = bytes.fromhex("808180") + b"x" * 128
+        element = parse_der(raw)
+        self.assertEqual(decode_implicit(element, 0, 0x04), b"x" * 128)
+        self.assertEqual(element.raw, raw)
+
+    def test_truncated_tag_length_and_value(self):
+        for raw in ("", "02", "0482", "048201", "04036162", "3081030201"):
+            with self.subTest(raw=raw):
+                self.assert_error("malformed", parse_der, bytes.fromhex(raw))
+
+    def test_indefinite_length(self):
+        for raw in ("30800201010000", "a080", "24800000"):
+            with self.subTest(raw=raw):
+                self.assert_error("non_der", parse_der, bytes.fromhex(raw))
+        self.assert_error("malformed", parse_der, bytes.fromhex("04800000"))
+
+    def test_non_minimal_length(self):
+        for raw in (bytes.fromhex("04810161"), bytes.fromhex("04820080") + b"x" * 128,
+                    bytes.fromhex("058100")):
+            with self.subTest(raw=raw[:8]):
+                self.assert_error("non_der", parse_der, raw)
+
+    def test_trailing_bytes(self):
+        for raw in ("050000", "0500020101", "020101ff"):
+            with self.subTest(raw=raw):
+                self.assert_error("malformed", parse_der, bytes.fromhex(raw))
+
+    def test_child_cannot_cross_parent(self):
+        raw = bytes.fromhex("300730020201020101")
+        outer = parse_der(raw)
+        inner, sibling = decode_children(outer)
+        self.assertEqual(sibling.raw, bytes.fromhex("020101"))
+        self.assert_error("malformed", decode_children, inner)
+        self.assert_error("malformed", decode_children, parse_der(bytes.fromhex("300102")))
+
+    def test_nested_non_der_identified_at_correct_layer(self):
+        element = parse_der(bytes.fromhex("3004a0023080"))
+        (wrapper,) = decode_children(element)
+        self.assertEqual(wrapper.raw, bytes.fromhex("a0023080"))
+        self.assert_error("non_der", decode_children, wrapper)
+
+    def test_invalid_identifier_and_reserved_length(self):
+        for raw in ("0000", "2000", "0f00", "04ff", "9f", "9f81", "9f800000", "9f1e00"):
+            with self.subTest(raw=raw):
+                self.assert_error("malformed", parse_der, bytes.fromhex(raw))
+
+    def test_unknown_tags_preserved_without_typed_interpretation(self):
+        raw = bytes.fromhex("9f81000178")
+        element = parse_der(raw)
+        self.assertEqual(element.identifier, bytes.fromhex("9f8100"))
+        self.assertEqual((element.tag_class, element.tag_number), (2, 128))
+        self.assertEqual(element.raw, raw)
+        self.assert_error("malformed", decode_value, element)
+        unknown = parse_der(bytes.fromhex("160178"))  # IA5String not in Medimo encoder profile
+        self.assertEqual(unknown.raw, bytes.fromhex("160178"))
+        self.assert_error("malformed", decode_value, unknown)
+
+    def test_basic_invalid_primitive_contents(self):
+        for raw in ("0100", "010200ff", "0200", "0202007f", "0202ff80", "0300", "030108",
+                    "030101", "050100", "0600", "060180", "06028000", "0c01ff", "13015f"):
+            with self.subTest(raw=raw):
+                self.assert_error("malformed", decode_value, parse_der(bytes.fromhex(raw)))
+        for raw in ("010101", "030206c1"):
+            with self.subTest(raw=raw):
+                self.assert_error("non_der", decode_value, parse_der(bytes.fromhex(raw)))
+
+    def test_invalid_calendar_and_time_profile(self):
+        for raw in (b"\x17\x0d260230000000Z", b"\x17\x0d261128250000Z",
+                    der_tlv(0x17, b"261128000000+2460"),
+                    der_tlv(0x18, b"20500101000000.5Z")):
+            self.assert_error("malformed", decode_value, parse_der(raw))
+        for raw in (b"\x17\x0b2611280000Z", der_tlv(0x17, b"261128000000+0700"),
+                    der_tlv(0x18, b"20500101000000.50Z"),
+                    der_tlv(0x18, b"20500101000000,5Z"),
+                    der_tlv(0x18, b"20500101000000")):
+            self.assert_error("non_der", decode_value, parse_der(raw))
+
+    def test_wrong_tag_and_context_shape(self):
+        integer = parse_der(bytes.fromhex("020101"))
+        self.assert_error("malformed", decode_value, integer, 0x04)
+        self.assert_error("malformed", decode_children, integer)
+        self.assert_error("malformed", decode_explicit, parse_der(bytes.fromhex("a000")), 0)
+        self.assert_error("malformed", decode_explicit, parse_der(bytes.fromhex("a103020101")), 0)
+        self.assert_error("malformed", decode_implicit, parse_der(bytes.fromhex("800101")), 0, 0x30)
+        self.assert_error("non_der", parse_der, bytes.fromhex("2403040178"))
+        for raw in ("2203020101", "1000", "1100", "2180"):
+            self.assert_error("malformed", parse_der, bytes.fromhex(raw))
+        self.assert_error("non_der", decode_implicit, parse_der(bytes.fromhex("a003040178")), 0, 0x04)
+
+    def test_invalid_input_and_boundaries(self):
+        for value in (None, "0500", bytearray(b"\x05\x00")):
+            self.assert_error("malformed", parse_der, value)
+        for offset, end in ((-1, 2), (True, 2), (0, 3), (2, 1), (0, True)):
+            self.assert_error("malformed", read_tlv, b"\x05\x00", offset, end)
+        self.assert_error("malformed", read_tlv, bytes.fromhex("020101"), 0, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
