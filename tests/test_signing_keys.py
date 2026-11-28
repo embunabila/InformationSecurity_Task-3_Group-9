@@ -7,6 +7,8 @@ from contextlib import closing, ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import ECC, RSA
@@ -32,7 +34,9 @@ from der import (
     parse_der,
 )
 
-from share_errors import KeyUnlockError
+from share_errors import KeyUnlockError, KeyLockedError
+from crypto_core import encrypt_blob
+from signing_keys import unlock_signing_key
 
 from signing_keys import (
     _emsa_pkcs1_v1_5_encode,
@@ -3797,6 +3801,1825 @@ class TestSigningKeyRetrieval(unittest.TestCase):
                         "Injected database connection failure",
                     ):
                         function(argument)
+
+
+# ============================================================
+# Stage 6: Complete signing-key unlock and security tests
+# ============================================================
+
+
+class TestUnlockSigningKey(unittest.TestCase):
+
+    USER_ID = 7
+    USERNAME = "unlock_signing_test_user"
+
+    EMPTY_USER_ID = 8
+
+    PASSWORD = "Medimo-Unlock-密码"
+    WRONG_PASSWORD = "Incorrect-Password"
+
+    NOW = datetime(
+        2026, 11, 28,
+        12, 0, 0,
+        tzinfo=timezone.utc,
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        """Generate real cryptographic fixtures once."""
+
+        directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(directory.cleanup)
+
+        cls.seed_path = (
+            Path(directory.name)
+            / "seed_unlock_signing.db"
+        )
+
+        password_hash = generate_password_hash(
+            cls.PASSWORD,
+            method="scrypt:131072:8:1",
+        )
+
+        with patch.object(
+            db,
+            "DB_PATH",
+            cls.seed_path,
+        ):
+            db.init_db()
+
+            with closing(db.get_connection()) as connection:
+                with connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO users (
+                            id,
+                            username,
+                            password_hash
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            (
+                                cls.USER_ID,
+                                cls.USERNAME,
+                                password_hash,
+                            ),
+                            (
+                                cls.EMPTY_USER_ID,
+                                "no_signing_key_user",
+                                password_hash,
+                            ),
+                        ),
+                    )
+
+            with patch(
+                "signing_keys._signing_utc_now",
+                return_value=cls.NOW,
+            ):
+                generate_signing_keypair(
+                    cls.USER_ID,
+                    cls.PASSWORD,
+                )
+
+            generate_user_keypair(
+                cls.USER_ID,
+                cls.PASSWORD,
+            )
+
+            with closing(db.get_connection()) as connection:
+                cls.signing_row = dict(
+                    connection.execute(
+                        """
+                        SELECT *
+                        FROM signing_keys
+                        WHERE user_id = ?
+                        """,
+                        (cls.USER_ID,),
+                    ).fetchone()
+                )
+
+                cls.encryption_row = dict(
+                    connection.execute(
+                        """
+                        SELECT *
+                        FROM user_keys
+                        WHERE user_id = ?
+                        """,
+                        (cls.USER_ID,),
+                    ).fetchone()
+                )
+
+        cls.signing_context = {
+            "owner_id": cls.USER_ID,
+            "kind": "signing_key",
+            "item_id": "signing_key",
+        }
+
+        cls.encryption_context = {
+            "owner_id": cls.USER_ID,
+            "kind": "private_key",
+            "item_id": "private_key",
+        }
+
+        # Recover the original test keys independently from
+        # unlock_signing_key, which is the function under test.
+        signing_kek = _derive_signing_kek(
+            cls.PASSWORD,
+            cls.signing_row["private_key_salt"],
+        )
+
+        encryption_kek = _derive_signing_kek(
+            cls.PASSWORD,
+            cls.encryption_row["private_key_salt"],
+        )
+
+        cls.original_private = RSA.import_key(
+            decrypt_blob(
+                cls.signing_row["encrypted_private_key"],
+                signing_kek,
+                "AES",
+                cls.signing_context,
+            )
+        )
+
+        cls.encryption_private = RSA.import_key(
+            decrypt_blob(
+                cls.encryption_row["encrypted_private_key"],
+                encryption_kek,
+                "AES",
+                cls.encryption_context,
+            )
+        )
+
+        del signing_kek
+        del encryption_kek
+
+    def setUp(self):
+        """Give each test an independent database copy."""
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+
+        self.db_path = (
+            Path(directory.name)
+            / "test_unlock_signing.db"
+        )
+
+        with closing(
+            sqlite3.connect(self.seed_path)
+        ) as source:
+            with closing(
+                sqlite3.connect(self.db_path)
+            ) as destination:
+                source.backup(destination)
+
+        db_patcher = patch.object(
+            db,
+            "DB_PATH",
+            self.db_path,
+        )
+
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+
+        clock_patcher = patch(
+            "signing_keys._signing_utc_now",
+            return_value=self.NOW,
+        )
+
+        self.clock = clock_patcher.start()
+        self.addCleanup(clock_patcher.stop)
+
+    # ========================================================
+    # Database and cryptographic fixture helpers
+    # ========================================================
+
+    def execute(self, sql, parameters=()):
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    sql,
+                    parameters,
+                )
+
+    def read_signing_row(self):
+        with closing(db.get_connection()) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM signing_keys
+                WHERE user_id = ?
+                """,
+                (self.USER_ID,),
+            ).fetchone()
+
+        return None if row is None else dict(row)
+
+    def read_encryption_row(self):
+        with closing(db.get_connection()) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM user_keys
+                WHERE user_id = ?
+                """,
+                (self.USER_ID,),
+            ).fetchone()
+
+        return None if row is None else dict(row)
+
+    def read_audit_count(self):
+        with closing(db.get_connection()) as connection:
+            return connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM signature_audit_log
+                """
+            ).fetchone()[0]
+
+    def set_lockout_state(
+        self,
+        count,
+        locked_until=None,
+    ):
+        self.execute(
+            """
+            UPDATE signing_keys
+            SET
+                failed_unlock_count = ?,
+                locked_until = ?
+            WHERE user_id = ?
+            """,
+            (
+                count,
+                locked_until,
+                self.USER_ID,
+            ),
+        )
+
+    def assert_lockout_state(
+        self,
+        count,
+        locked_until=None,
+    ):
+        row = self.read_signing_row()
+
+        self.assertIsNotNone(row)
+
+        self.assertEqual(
+            row["failed_unlock_count"],
+            count,
+        )
+
+        self.assertEqual(
+            row["locked_until"],
+            locked_until,
+        )
+
+    def update_material(self, field, value):
+        # Only fixed, explicitly allowed test fixture columns
+        # may be used to construct this SQL statement.
+        allowed_fields = {
+            "public_key_pem",
+            "fingerprint",
+            "certificate_der",
+            "private_key_salt",
+            "encrypted_private_key",
+            "expires_at",
+            "created_at",
+        }
+
+        self.assertIn(field, allowed_fields)
+
+        self.execute(
+            f"""
+            UPDATE signing_keys
+            SET {field} = ?
+            WHERE user_id = ?
+            """,
+            (value, self.USER_ID),
+        )
+
+    def replace_encrypted_private_key(
+        self,
+        private_der,
+        *,
+        context=None,
+    ):
+        """Encrypt deliberately substituted material with a real KEK."""
+
+        row = self.read_signing_row()
+
+        kek = _derive_signing_kek(
+            self.PASSWORD,
+            row["private_key_salt"],
+        )
+
+        if context is None:
+            context = self.signing_context
+
+        envelope = encrypt_blob(
+            private_der,
+            kek,
+            "AES",
+            context,
+        )
+
+        del kek
+
+        self.update_material(
+            "encrypted_private_key",
+            envelope,
+        )
+
+    def assert_recovery_failure(self):
+        before = self.read_signing_row()
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_signing_key(
+                self.USER_ID,
+                self.PASSWORD,
+            )
+
+        after = self.read_signing_row()
+
+        expected = dict(before)
+        expected["failed_unlock_count"] += 1
+
+        # Only the failed-attempt counter may change.
+        self.assertEqual(
+            after,
+            expected,
+        )
+
+    # ========================================================
+    # Successful recovery and actual signing operations
+    # ========================================================
+
+    def test_successful_signing_key_unlock(self):
+        before = self.read_signing_row()
+
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertIsInstance(
+            key,
+            RSA.RsaKey,
+        )
+
+        self.assertTrue(
+            key.has_private()
+        )
+
+        self.assertEqual(
+            key.size_in_bits(),
+            3072,
+        )
+
+        self.assertEqual(
+            (
+                key.n,
+                key.e,
+                key.d,
+            ),
+            (
+                self.original_private.n,
+                self.original_private.e,
+                self.original_private.d,
+            ),
+        )
+
+        self.assertEqual(
+            key.public_key().export_key(
+                format="DER"
+            ),
+            self.original_private.public_key().export_key(
+                format="DER"
+            ),
+        )
+
+        message = b"Recovered signing key integration test"
+
+        signature = rsa_sign(
+            key,
+            message,
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                before["public_key_pem"],
+                message,
+                signature,
+            )
+        )
+
+        pkcs1_15.new(
+            key.public_key()
+        ).verify(
+            SHA256.new(message),
+            signature,
+        )
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+        self.assertEqual(
+            self.read_audit_count(),
+            0,
+        )
+
+    def test_recovered_key_builds_valid_cms(self):
+        from cms import (
+            build_cms_signed_data,
+            parse_cms_signed_data,
+        )
+
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        document = (
+            b"Medimo signing key unlock CMS test.\x00\xff"
+        )
+
+        digest = SHA256.new(
+            document
+        ).digest()
+
+        row = get_signing_key(
+            self.USER_ID
+        )
+
+        cms_der = build_cms_signed_data(
+            digest,
+            row["certificate_der"],
+            key,
+            self.NOW,
+        )
+
+        parsed = parse_cms_signed_data(
+            cms_der
+        )
+
+        self.assertEqual(
+            parsed["certificate_der"],
+            row["certificate_der"],
+        )
+
+        self.assertEqual(
+            parsed["message_digest"],
+            digest,
+        )
+
+        self.assertEqual(
+            parsed["signing_time"],
+            self.NOW,
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                row["public_key_pem"],
+                parsed["signed_attrs_der"],
+                parsed["signature"],
+            )
+        )
+
+        self.assertLessEqual(
+            len(cms_der),
+            8192,
+        )
+
+    # ========================================================
+    # Input validation and failed recovery
+    # ========================================================
+
+    def test_wrong_password_increments_counter(self):
+        before = self.read_signing_row()
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_signing_key(
+                self.USER_ID,
+                self.WRONG_PASSWORD,
+            )
+
+        expected = dict(before)
+        expected["failed_unlock_count"] = 1
+
+        self.assertEqual(
+            self.read_signing_row(),
+            expected,
+        )
+
+    def test_invalid_user_ids_are_rejected(self):
+        values = (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            "7",
+            b"7",
+            7.0,
+            1 << 63,
+            10**100,
+        )
+
+        before = self.read_signing_row()
+
+        with patch(
+            "signing_keys.get_connection",
+            side_effect=AssertionError(
+                "Invalid user ID reached the database"
+            ),
+        ) as factory:
+
+            for value in values:
+                with self.subTest(user_id=value):
+                    with self.assertRaises(ValueError):
+                        unlock_signing_key(
+                            value,
+                            self.PASSWORD,
+                        )
+
+            factory.assert_not_called()
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+    def test_invalid_password_inputs_are_rejected(self):
+        values = (
+            None,
+            "",
+            123,
+            True,
+            b"password",
+            "\ud800",
+        )
+
+        with patch(
+            "signing_keys._derive_signing_kek",
+            side_effect=AssertionError(
+                "Invalid password reached the KDF"
+            ),
+        ) as derive:
+
+            for value in values:
+                with self.subTest(
+                    input_type=type(value).__name__
+                ):
+                    self.set_lockout_state(0)
+
+                    with self.assertRaises(KeyUnlockError):
+                        unlock_signing_key(
+                            self.USER_ID,
+                            value,
+                        )
+
+                    self.assert_lockout_state(1)
+
+            derive.assert_not_called()
+
+    def test_missing_signing_key_is_rejected(self):
+        before = self.read_signing_row()
+
+        with patch(
+            "signing_keys._derive_signing_kek",
+            side_effect=AssertionError(
+                "Missing key reached KDF"
+            ),
+        ) as derive:
+
+            for user_id in (
+                self.EMPTY_USER_ID,
+                999999,
+            ):
+                with self.subTest(user_id=user_id):
+                    with self.assertRaises(KeyUnlockError):
+                        unlock_signing_key(
+                            user_id,
+                            self.PASSWORD,
+                        )
+
+            derive.assert_not_called()
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+    # ========================================================
+    # Lockout boundaries
+    # ========================================================
+
+    def test_complete_five_failure_sequence(self):
+        for attempt in range(1, 6):
+            expected_error = (
+                KeyUnlockError
+                if attempt < 5
+                else KeyLockedError
+            )
+
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(expected_error):
+                    unlock_signing_key(
+                        self.USER_ID,
+                        self.WRONG_PASSWORD,
+                    )
+
+                if attempt < 5:
+                    self.assert_lockout_state(
+                        attempt,
+                    )
+
+                else:
+                    expected_until = (
+                        self.NOW
+                        + timedelta(minutes=15)
+                    )
+
+                    self.assert_lockout_state(
+                        5,
+                        expected_until.isoformat(),
+                    )
+
+                    actual_until = datetime.fromisoformat(
+                        self.read_signing_row()[
+                            "locked_until"
+                        ]
+                    )
+
+                    self.assertEqual(
+                        actual_until - self.NOW,
+                        timedelta(minutes=15),
+                    )
+
+                    self.assertEqual(
+                        actual_until.utcoffset(),
+                        timedelta(0),
+                    )
+
+    def test_active_lockout_rejects_without_extension(self):
+        locked_until = (
+            self.NOW
+            + timedelta(minutes=15)
+        ).isoformat()
+
+        self.set_lockout_state(
+            5,
+            locked_until,
+        )
+
+        before = self.read_signing_row()
+
+        with patch(
+            "signing_keys._derive_signing_kek",
+            side_effect=AssertionError(
+                "Active lockout must not run scrypt"
+            ),
+        ) as derive:
+
+            for elapsed in (
+                0,
+                60,
+                899,
+            ):
+                self.clock.return_value = (
+                    self.NOW
+                    + timedelta(seconds=elapsed)
+                )
+
+                for password in (
+                    self.PASSWORD,
+                    self.WRONG_PASSWORD,
+                ):
+                    with self.subTest(
+                        elapsed=elapsed,
+                        correct=password == self.PASSWORD,
+                    ):
+                        with self.assertRaises(KeyLockedError):
+                            unlock_signing_key(
+                                self.USER_ID,
+                                password,
+                            )
+
+                        self.assertEqual(
+                            self.read_signing_row(),
+                            before,
+                        )
+
+            derive.assert_not_called()
+
+    def test_expired_lockout_wrong_password_restarts_counter(self):
+        self.set_lockout_state(
+            5,
+            self.NOW.isoformat(),
+        )
+
+        # now == locked_until is no longer an active lockout.
+        with self.assertRaises(KeyUnlockError):
+            unlock_signing_key(
+                self.USER_ID,
+                self.WRONG_PASSWORD,
+            )
+
+        self.assert_lockout_state(
+            1,
+            None,
+        )
+
+    def test_expired_lockout_correct_password_resets_state(self):
+        self.set_lockout_state(
+            5,
+            self.NOW.isoformat(),
+        )
+
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertTrue(
+            key.has_private()
+        )
+
+        self.assertEqual(
+            key.n,
+            self.original_private.n,
+        )
+
+        self.assert_lockout_state(
+            0,
+            None,
+        )
+
+    def test_success_resets_partial_failed_counter(self):
+        self.set_lockout_state(4)
+
+        before = self.read_signing_row()
+
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertEqual(
+            key.n,
+            self.original_private.n,
+        )
+
+        expected = dict(before)
+
+        expected["failed_unlock_count"] = 0
+        expected["locked_until"] = None
+
+        self.assertEqual(
+            self.read_signing_row(),
+            expected,
+        )
+
+    # ========================================================
+    # Concurrent requests
+    # ========================================================
+
+    def test_concurrent_failed_attempts_remain_capped_at_five(self):
+        self.set_lockout_state(4)
+
+        barrier = Barrier(2)
+
+        original_recover = (
+            signing_keys._recover_signing_private_key
+        )
+
+        def synchronized_recovery(
+            user_id,
+            password,
+            row,
+        ):
+            # Both requests perform real scrypt/decryption.
+            # Synchronize only before their final transaction.
+            try:
+                return original_recover(
+                    user_id,
+                    password,
+                    row,
+                )
+
+            except KeyUnlockError:
+                barrier.wait(timeout=30)
+                raise
+
+        def attempt():
+            try:
+                unlock_signing_key(
+                    self.USER_ID,
+                    self.WRONG_PASSWORD,
+                )
+
+            except (
+                KeyUnlockError,
+                KeyLockedError,
+            ) as exc:
+                return type(exc)
+
+            raise AssertionError(
+                "Wrong password unexpectedly unlocked key"
+            )
+
+        with patch(
+            "signing_keys._recover_signing_private_key",
+            side_effect=synchronized_recovery,
+        ):
+            with ThreadPoolExecutor(
+                max_workers=2
+            ) as executor:
+
+                futures = [
+                    executor.submit(attempt)
+                    for _ in range(2)
+                ]
+
+                results = [
+                    future.result(timeout=60)
+                    for future in futures
+                ]
+
+        self.assertEqual(
+            results,
+            [
+                KeyLockedError,
+                KeyLockedError,
+            ],
+        )
+
+        self.assert_lockout_state(
+            5,
+            (
+                self.NOW
+                + timedelta(minutes=15)
+            ).isoformat(),
+        )
+
+    def test_concurrent_lockout_blocks_successful_recovery(self):
+        self.set_lockout_state(4)
+
+        original_recover = (
+            signing_keys._recover_signing_private_key
+        )
+
+        def recover_then_concurrent_failure(
+            user_id,
+            password,
+            row,
+        ):
+            key = original_recover(
+                user_id,
+                password,
+                row,
+            )
+
+            if password == self.PASSWORD:
+                # Another genuine failed unlock creates an
+                # active lockout before this request finalizes.
+                with self.assertRaises(KeyLockedError):
+                    unlock_signing_key(
+                        user_id,
+                        self.WRONG_PASSWORD,
+                    )
+
+            return key
+
+        with patch(
+            "signing_keys._recover_signing_private_key",
+            side_effect=recover_then_concurrent_failure,
+        ):
+            with self.assertRaises(KeyLockedError):
+                unlock_signing_key(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_lockout_state(
+            5,
+            (
+                self.NOW
+                + timedelta(minutes=15)
+            ).isoformat(),
+        )
+
+    # ========================================================
+    # Authenticated encryption and malformed recovered keys
+    # ========================================================
+
+    def test_corrupted_encrypted_private_key_is_rejected(self):
+        envelope = self.signing_row[
+            "encrypted_private_key"
+        ]
+
+        modified = (
+            envelope[:-1]
+            + bytes([envelope[-1] ^ 1])
+        )
+
+        self.update_material(
+            "encrypted_private_key",
+            modified,
+        )
+
+        self.assert_recovery_failure()
+
+    def test_corrupted_salt_is_rejected(self):
+        original = self.signing_row[
+            "private_key_salt"
+        ]
+
+        altered = (
+            bytes([original[0] ^ 1])
+            + original[1:]
+        )
+
+        for salt in (
+            b"",
+            bytes(15),
+            bytes(17),
+            "not-bytes-value!",
+            altered,
+        ):
+            with self.subTest(
+                salt_type=type(salt).__name__,
+                length=len(salt),
+            ):
+                self.set_lockout_state(0)
+
+                self.update_material(
+                    "private_key_salt",
+                    salt,
+                )
+
+                self.assert_recovery_failure()
+
+    def test_wrong_authenticated_context_is_rejected(self):
+        private_der = (
+            self.original_private.export_key(
+                format="DER",
+                pkcs=8,
+            )
+        )
+
+        contexts = (
+            self.encryption_context,
+            {
+                "owner_id": self.USER_ID + 1,
+                "kind": "signing_key",
+                "item_id": "signing_key",
+            },
+        )
+
+        for context in contexts:
+            with self.subTest(context=context):
+                self.set_lockout_state(0)
+
+                self.replace_encrypted_private_key(
+                    private_der,
+                    context=context,
+                )
+
+                self.assert_recovery_failure()
+
+    def test_recovered_rsa2048_private_key_is_rejected(self):
+        other_key = RSA.generate(2048)
+
+        self.replace_encrypted_private_key(
+            other_key.export_key(
+                format="DER",
+                pkcs=8,
+            )
+        )
+
+        self.assert_recovery_failure()
+
+    def test_recovered_public_only_key_is_rejected(self):
+        public_der = (
+            self.original_private.public_key()
+            .export_key(format="DER")
+        )
+
+        self.replace_encrypted_private_key(
+            public_der,
+        )
+
+        self.assert_recovery_failure()
+
+    def test_inconsistent_private_components_are_rejected(self):
+        original = self.original_private
+
+        inconsistent = RSA.construct(
+            (
+                original.n,
+                original.e,
+                original.d + 1,
+                original.p,
+                original.q,
+            ),
+            consistency_check=False,
+        )
+
+        self.replace_encrypted_private_key(
+            inconsistent.export_key(
+                format="DER",
+                pkcs=8,
+            )
+        )
+
+        self.assert_recovery_failure()
+
+    def test_explicit_private_component_validation_after_import(self):
+        original = self.original_private
+
+        inconsistent = RSA.construct(
+            (
+                original.n,
+                original.e,
+                original.d + 1,
+                original.p,
+                original.q,
+            ),
+            consistency_check=False,
+        )
+
+        original_import = RSA.import_key
+
+        private_der = original.export_key(
+            format="DER",
+            pkcs=8,
+        )
+
+        def defensive_import_fixture(
+            encoded,
+            *args,
+            **kwargs,
+        ):
+            # Defensive boundary injection only.
+            # The real KEK and decryption still execute.
+            if encoded == private_der:
+                return inconsistent
+
+            return original_import(
+                encoded,
+                *args,
+                **kwargs,
+            )
+
+        with patch(
+            "signing_keys.RSA.import_key",
+            side_effect=defensive_import_fixture,
+        ) as imported:
+
+            self.assert_recovery_failure()
+
+            imported.assert_called_with(
+                private_der,
+            )
+
+    def test_invalid_pkcs8_encoding_is_rejected(self):
+        invalid_values = (
+            b"not a private key",
+            b"\x30\x00",
+            self.original_private.export_key(
+                format="DER",
+                pkcs=1,
+            ),
+        )
+
+        for private_der in invalid_values:
+            with self.subTest(
+                length=len(private_der)
+            ):
+                self.set_lockout_state(0)
+
+                self.replace_encrypted_private_key(
+                    private_der,
+                )
+
+                self.assert_recovery_failure()
+
+    # ========================================================
+    # Stored public key and certificate consistency
+    # ========================================================
+
+    def test_stored_public_key_mismatch_is_rejected(self):
+        self.update_material(
+            "public_key_pem",
+            self.encryption_row[
+                "public_key_pem"
+            ],
+        )
+
+        self.assert_recovery_failure()
+
+    def test_stored_fingerprint_mismatch_is_rejected(self):
+        self.update_material(
+            "fingerprint",
+            self.encryption_row[
+                "fingerprint"
+            ],
+        )
+
+        self.assert_recovery_failure()
+
+    def test_stored_certificate_public_key_mismatch_is_rejected(self):
+        original = parse_certificate(
+            self.signing_row[
+                "certificate_der"
+            ]
+        )
+
+        other_certificate = build_self_signed_certificate(
+            self.encryption_private,
+            self.USERNAME,
+            original["not_before"],
+            original["not_after"],
+        )
+
+        parsed = parse_certificate(
+            other_certificate
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                parsed["public_key_pem"],
+                parsed["tbs_der"],
+                parsed["signature"],
+            )
+        )
+
+        self.update_material(
+            "certificate_der",
+            other_certificate,
+        )
+
+        self.assert_recovery_failure()
+
+    def test_stored_certificate_signature_tampering_is_rejected(self):
+        certificate = self.signing_row[
+            "certificate_der"
+        ]
+
+        modified = (
+            certificate[:-1]
+            + bytes([certificate[-1] ^ 1])
+        )
+
+        parsed = parse_certificate(
+            modified
+        )
+
+        self.assertFalse(
+            rsa_verify(
+                parsed["public_key_pem"],
+                parsed["tbs_der"],
+                parsed["signature"],
+            )
+        )
+
+        self.update_material(
+            "certificate_der",
+            modified,
+        )
+
+        self.assert_recovery_failure()
+
+    def test_malformed_stored_certificate_is_rejected(self):
+        original = self.signing_row[
+            "certificate_der"
+        ]
+
+        for certificate in (
+            b"",
+            b"\x30\x00",
+            original[:-1],
+            original + b"\x00",
+        ):
+            with self.subTest(
+                length=len(certificate)
+            ):
+                self.set_lockout_state(0)
+
+                self.update_material(
+                    "certificate_der",
+                    certificate,
+                )
+
+                self.assert_recovery_failure()
+
+    def test_stored_certificate_expiry_mismatch_is_rejected(self):
+        expiry = datetime.fromisoformat(
+            self.signing_row["expires_at"]
+        )
+
+        values = (
+            (
+                expiry
+                + timedelta(seconds=1)
+            ).isoformat(),
+            "not-a-timestamp",
+            expiry.replace(tzinfo=None).isoformat(),
+        )
+
+        for value in values:
+            with self.subTest(expires_at=value):
+                self.set_lockout_state(0)
+
+                self.update_material(
+                    "expires_at",
+                    value,
+                )
+
+                self.assert_recovery_failure()
+
+    def test_stored_certificate_created_at_mismatch_is_rejected(self):
+        original = datetime.fromisoformat(
+            self.signing_row["created_at"]
+        )
+
+        modified = (
+            original - timedelta(seconds=1)
+        ).isoformat()
+
+        self.update_material(
+            "created_at",
+            modified,
+        )
+
+        self.assert_recovery_failure()
+
+    # ========================================================
+    # Stale snapshots and concurrent material replacement
+    # ========================================================
+
+    def test_key_material_changes_during_unlock(self):
+        original_recover = (
+            signing_keys._recover_signing_private_key
+        )
+
+        cases = (
+            (
+                "public_key_pem",
+                self.encryption_row[
+                    "public_key_pem"
+                ],
+            ),
+            (
+                "fingerprint",
+                self.encryption_row[
+                    "fingerprint"
+                ],
+            ),
+            (
+                "certificate_der",
+                b"\x30\x00",
+            ),
+            (
+                "private_key_salt",
+                self.encryption_row[
+                    "private_key_salt"
+                ],
+            ),
+            (
+                "encrypted_private_key",
+                self.encryption_row[
+                    "encrypted_private_key"
+                ],
+            ),
+            (
+                "expires_at",
+                "2040-01-01T00:00:00+00:00",
+            ),
+            (
+                "created_at",
+                "2020-01-01T00:00:00+00:00",
+            ),
+        )
+
+        for field, replacement in cases:
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    self.signing_row[field],
+                    replacement,
+                )
+
+                self.set_lockout_state(2)
+
+                def recover_then_replace(
+                    user_id,
+                    password,
+                    row,
+                ):
+                    key = original_recover(
+                        user_id,
+                        password,
+                        row,
+                    )
+
+                    # Separate SQLite connection simulates
+                    # a concurrent key material replacement.
+                    self.update_material(
+                        field,
+                        replacement,
+                    )
+
+                    return key
+
+                try:
+                    with patch(
+                        "signing_keys._recover_signing_private_key",
+                        side_effect=recover_then_replace,
+                    ):
+                        with self.assertRaises(KeyUnlockError):
+                            unlock_signing_key(
+                                self.USER_ID,
+                                self.PASSWORD,
+                            )
+
+                    self.assertEqual(
+                        self.read_signing_row()[field],
+                        replacement,
+                    )
+
+                    # A stale recovery must not reset the
+                    # security state of the replacement record.
+                    self.assert_lockout_state(2)
+
+                finally:
+                    self.update_material(
+                        field,
+                        self.signing_row[field],
+                    )
+
+    def test_key_deleted_during_unlock(self):
+        original_recover = (
+            signing_keys._recover_signing_private_key
+        )
+
+        def recover_then_delete(
+            user_id,
+            password,
+            row,
+        ):
+            key = original_recover(
+                user_id,
+                password,
+                row,
+            )
+
+            self.execute(
+                """
+                DELETE FROM signing_keys
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+
+            return key
+
+        with patch(
+            "signing_keys._recover_signing_private_key",
+            side_effect=recover_then_delete,
+        ):
+            with self.assertRaises(KeyUnlockError):
+                unlock_signing_key(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assertIsNone(
+            self.read_signing_row()
+        )
+
+    # ========================================================
+    # Database transaction failure and connection cleanup
+    # ========================================================
+
+    def test_database_update_failure_rolls_back_and_returns_no_key(self):
+        self.set_lockout_state(2)
+
+        before = self.read_signing_row()
+
+        # SQLite RAISE(FAIL) may preserve changes already made
+        # by the statement until the transaction rolls back.
+        self.execute(
+            """
+            CREATE TRIGGER test_fail_signing_unlock
+            AFTER UPDATE ON signing_keys
+            BEGIN
+                SELECT RAISE(
+                    FAIL,
+                    'Injected signing unlock update failure'
+                );
+            END
+            """
+        )
+
+        connections = []
+
+        def track_connection():
+            connection = db.get_connection()
+            connections.append(connection)
+            return connection
+
+        with patch(
+            "signing_keys.get_connection",
+            side_effect=track_connection,
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "Injected signing unlock update failure",
+            ):
+                unlock_signing_key(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+        self.assertEqual(
+            len(connections),
+            2,
+        )
+
+        for connection in connections:
+            with self.assertRaises(
+                sqlite3.ProgrammingError
+            ):
+                connection.execute("SELECT 1")
+
+        self.execute(
+            """
+            DROP TRIGGER test_fail_signing_unlock
+            """
+        )
+
+        # The database remains usable after the rollback.
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertEqual(
+            key.n,
+            self.original_private.n,
+        )
+
+        self.assert_lockout_state(0)
+
+    def test_database_commit_failure_returns_no_private_key(self):
+        self.set_lockout_state(2)
+
+        before = self.read_signing_row()
+
+        # A deferred foreign-key violation causes the
+        # final transaction COMMIT to fail, not its UPDATE.
+        # This table exists exclusively in the test database.
+        self.execute(
+            """
+            CREATE TABLE test_unlock_commit_guard (
+                user_id INTEGER NOT NULL,
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    DEFERRABLE INITIALLY DEFERRED
+            )
+            """
+        )
+
+        self.execute(
+            """
+            CREATE TRIGGER test_fail_signing_commit
+            AFTER UPDATE ON signing_keys
+            BEGIN
+                INSERT INTO test_unlock_commit_guard (
+                    user_id
+                )
+                VALUES (999999);
+            END
+            """
+        )
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            unlock_signing_key(
+                self.USER_ID,
+                self.PASSWORD,
+            )
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+        with closing(db.get_connection()) as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM test_unlock_commit_guard
+                """
+            ).fetchone()[0]
+
+        self.assertEqual(count, 0)
+
+    def test_connections_close_on_success_and_authentication_failure(self):
+        for password in (
+            self.PASSWORD,
+            self.WRONG_PASSWORD,
+        ):
+            with self.subTest(
+                correct=password == self.PASSWORD
+            ):
+                connections = []
+
+                def track_connection():
+                    connection = db.get_connection()
+                    connections.append(connection)
+                    return connection
+
+                with patch(
+                    "signing_keys.get_connection",
+                    side_effect=track_connection,
+                ):
+                    if password == self.PASSWORD:
+                        key = unlock_signing_key(
+                            self.USER_ID,
+                            password,
+                        )
+
+                        self.assertTrue(
+                            key.has_private()
+                        )
+
+                    else:
+                        with self.assertRaises(KeyUnlockError):
+                            unlock_signing_key(
+                                self.USER_ID,
+                                password,
+                            )
+
+                self.assertEqual(
+                    len(connections),
+                    2,
+                )
+
+                for connection in connections:
+                    with self.assertRaises(
+                        sqlite3.ProgrammingError
+                    ):
+                        connection.execute(
+                            "SELECT 1"
+                        )
+
+    def test_ignored_database_update_does_not_return_key(self):
+        self.set_lockout_state(2)
+
+        before = self.read_signing_row()
+
+        self.execute(
+            """
+            CREATE TRIGGER test_ignore_signing_update
+            BEFORE UPDATE ON signing_keys
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END
+            """
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "security state was not updated",
+        ):
+            unlock_signing_key(
+                self.USER_ID,
+                self.PASSWORD,
+            )
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+    # ========================================================
+    # Task 2 key and lockout isolation
+    # ========================================================
+
+    def test_task2_key_and_lockout_remain_unchanged(self):
+        legacy_locked_until = (
+            self.NOW
+            + timedelta(minutes=15)
+        ).isoformat()
+
+        self.execute(
+            """
+            UPDATE user_keys
+            SET
+                failed_unlock_count = 5,
+                locked_until = ?
+            WHERE user_id = ?
+            """,
+            (
+                legacy_locked_until,
+                self.USER_ID,
+            ),
+        )
+
+        before = self.read_encryption_row()
+
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertEqual(
+            key.n,
+            self.original_private.n,
+        )
+
+        self.assertNotEqual(
+            key.n,
+            self.encryption_private.n,
+        )
+
+        with self.assertRaises(KeyUnlockError):
+            unlock_signing_key(
+                self.USER_ID,
+                self.WRONG_PASSWORD,
+            )
+
+        self.assert_lockout_state(1)
+
+        self.assertEqual(
+            self.read_encryption_row(),
+            before,
+        )
+
+        self.assertEqual(
+            self.read_audit_count(),
+            0,
+        )
+
+    def test_signing_and_encryption_envelopes_cannot_be_swapped(self):
+        before = self.read_encryption_row()
+
+        # Even when the corresponding Task 2 salt is copied,
+        # its envelope is authenticated to another context.
+        self.update_material(
+            "private_key_salt",
+            before["private_key_salt"],
+        )
+
+        self.update_material(
+            "encrypted_private_key",
+            before["encrypted_private_key"],
+        )
+
+        self.assert_recovery_failure()
+
+        # Test the opposite direction using the correct
+        # signing KEK but the Task 2 authenticated context.
+        signing_kek = _derive_signing_kek(
+            self.PASSWORD,
+            self.signing_row[
+                "private_key_salt"
+            ],
+        )
+
+        try:
+            with self.assertRaises(InvalidEnvelopeError):
+                decrypt_blob(
+                    self.signing_row[
+                        "encrypted_private_key"
+                    ],
+                    signing_kek,
+                    "AES",
+                    self.encryption_context,
+                )
+
+        finally:
+            del signing_kek
+
+        self.assertEqual(
+            self.read_encryption_row(),
+            before,
+        )
+
+    # ========================================================
+    # Expiration policy and unexpected failures
+    # ========================================================
+
+    def test_expired_certificate_is_not_unlock_policy(self):
+        expires_at = datetime.fromisoformat(
+            self.signing_row["expires_at"]
+        )
+
+        self.clock.return_value = (
+            expires_at
+            + timedelta(seconds=1)
+        )
+
+        self.assertGreater(
+            self.clock.return_value,
+            expires_at,
+        )
+
+        key = unlock_signing_key(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertTrue(
+            key.has_private()
+        )
+
+        self.assertEqual(
+            key.n,
+            self.original_private.n,
+        )
+
+        self.assert_lockout_state(0)
+
+        # This does not authorize signing after expiry.
+        # sign_pdf enforces expiration before unlock.
+
+    def test_unexpected_internal_failure_is_not_counted(self):
+        self.set_lockout_state(2)
+
+        before = self.read_signing_row()
+
+        with patch(
+            "signing_keys._derive_signing_kek",
+            side_effect=RuntimeError(
+                "Injected internal KDF failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Injected internal KDF failure",
+            ):
+                unlock_signing_key(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assertEqual(
+            self.read_signing_row(),
+            before,
+        )
+
+    def test_corrupted_lockout_metadata_fails_closed(self):
+        cases = (
+            (-1, None),
+            (6, None),
+            (5, None),
+            (5, "not-a-timestamp"),
+            (5, "2026-11-28T12:15:00"),
+        )
+
+        with patch(
+            "signing_keys._derive_signing_kek",
+            side_effect=AssertionError(
+                "Corrupted lockout state reached KDF"
+            ),
+        ) as derive:
+
+            for count, locked_until in cases:
+                with self.subTest(
+                    count=count,
+                    locked_until=locked_until,
+                ):
+                    self.set_lockout_state(
+                        count,
+                        locked_until,
+                    )
+
+                    before = self.read_signing_row()
+
+                    with self.assertRaises(KeyUnlockError):
+                        unlock_signing_key(
+                            self.USER_ID,
+                            self.PASSWORD,
+                        )
+
+                    self.assertEqual(
+                        self.read_signing_row(),
+                        before,
+                    )
+
+            derive.assert_not_called()
 
 
 if __name__ == "__main__":
