@@ -20,9 +20,18 @@ from certificate import (
     parse_certificate,
 )
 
-from crypto_core import encrypt_blob
+from crypto_core import (
+    encrypt_blob,
+    decrypt_blob,
+    InvalidEnvelopeError,
+)
 from db import get_connection
-from share_errors import KeyUnlockError
+from share_errors import (
+    KeyUnlockError,
+    KeyLockedError,
+    InvalidSignatureError,
+    UnsupportedSignatureError,
+)
 
 from der import (
     decode_value,
@@ -822,3 +831,606 @@ def find_signer_by_fingerprint(fingerprint) -> dict | None:
         "user_id": row["user_id"],
         "username": row["username"],
     }
+
+
+# ============================================================
+# Stage 6: Signing-key unlock and security
+# ============================================================
+
+_SIGNING_MAX_FAILED_ATTEMPTS = 5
+_SIGNING_LOCKOUT_MINUTES = 15
+
+_SIGNING_UNLOCK_MESSAGE = (
+    "Private signing key could not be verified."
+)
+
+_SIGNING_LOCKED_MESSAGE = (
+    "Too many signing key unlock attempts."
+)
+
+_SIGNING_MATERIAL_FIELDS = (
+    "public_key_pem",
+    "fingerprint",
+    "certificate_der",
+    "private_key_salt",
+    "encrypted_private_key",
+    "expires_at",
+    "created_at",
+)
+
+
+def _read_signing_unlock_state(connection, user_id):
+    """Read signing key material and its independent lockout state."""
+
+    return connection.execute(
+        """
+        SELECT
+            public_key_pem,
+            fingerprint,
+            certificate_der,
+            private_key_salt,
+            encrypted_private_key,
+            expires_at,
+            created_at,
+            failed_unlock_count,
+            locked_until
+        FROM signing_keys
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+def _parse_signing_timestamp(value):
+    """Parse a timezone-aware UTC timestamp from signing_keys."""
+
+    if not isinstance(value, str):
+        raise ValueError("Expected UTC timestamp")
+
+    result = datetime.fromisoformat(value)
+
+    if (
+        result.tzinfo is None
+        or result.utcoffset() != timedelta(0)
+    ):
+        raise ValueError(
+            "Expected timezone-aware UTC timestamp"
+        )
+
+    return result.astimezone(timezone.utc)
+
+
+def _update_signing_unlock_state(
+    connection,
+    user_id,
+    count,
+    locked_until,
+):
+    """Update only the signing key's security state."""
+
+    cursor = connection.execute(
+        """
+        UPDATE signing_keys
+        SET
+            failed_unlock_count = ?,
+            locked_until = ?
+        WHERE user_id = ?
+        """,
+        (
+            count,
+            locked_until,
+            user_id,
+        ),
+    )
+
+    if cursor.rowcount != 1:
+        raise RuntimeError(
+            "Signing key security state was not updated."
+        )
+
+
+def _check_signing_unlock_state(
+    connection,
+    user_id,
+    row,
+    now,
+):
+    """Reject active lockouts and reset expired lockouts."""
+
+    count = row["failed_unlock_count"]
+
+    try:
+        if (
+            type(count) is not int
+            or not 0 <= count <= _SIGNING_MAX_FAILED_ATTEMPTS
+        ):
+            raise ValueError(
+                "Invalid failed unlock count"
+            )
+
+        locked_until = (
+            None
+            if row["locked_until"] is None
+            else _parse_signing_timestamp(
+                row["locked_until"]
+            )
+        )
+
+        # Fail closed if the stored counter indicates a lockout
+        # but the required expiry timestamp is missing.
+        if (
+            locked_until is None
+            and count == _SIGNING_MAX_FAILED_ATTEMPTS
+        ):
+            raise ValueError(
+                "Missing lockout timestamp"
+            )
+
+    except (ValueError, OverflowError):
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        ) from None
+
+    if locked_until is not None:
+        if now < locked_until:
+            raise KeyLockedError(
+                _SIGNING_LOCKED_MESSAGE
+            )
+
+        # The previous lockout has expired.
+        _update_signing_unlock_state(
+            connection,
+            user_id,
+            0,
+            None,
+        )
+
+        return 0
+
+    return count
+
+
+def _same_signing_key_material(first, second):
+    """Detect replacement of any stored signing key material."""
+
+    return all(
+        first[field] == second[field]
+        for field in _SIGNING_MATERIAL_FIELDS
+    )
+
+
+def _recover_signing_private_key(
+    user_id,
+    password,
+    row,
+):
+    """Recover and validate an authenticated RSA-3072 signing key."""
+
+    if (
+        not isinstance(password, str)
+        or not password
+    ):
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        )
+
+    salt = row["private_key_salt"]
+    envelope = row["encrypted_private_key"]
+
+    if (
+        not isinstance(salt, bytes)
+        or len(salt) != _SIGNING_KEK_SALT_SIZE
+        or not isinstance(envelope, bytes)
+    ):
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        )
+
+    # Distinguish malformed password input from unexpected
+    # internal failures during the actual KDF operation.
+    try:
+        password.encode("utf-8")
+
+    except UnicodeError:
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        ) from None
+
+    kek = _derive_signing_kek(
+        password,
+        salt,
+    )
+
+    try:
+        private_der = decrypt_blob(
+            envelope,
+            kek,
+            "AES",
+            _signing_key_context(user_id),
+        )
+
+    except InvalidEnvelopeError:
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        ) from None
+
+    finally:
+        # Release the reference, not guaranteed zeroization.
+        del kek
+
+    # ========================================================
+    # Validate recovered private key
+    # ========================================================
+
+    try:
+        fields = decode_value(
+            validate_tree(
+                parse_der(private_der)
+            ),
+            0x30,
+        )
+
+        # Generation stores PKCS#8 PrivateKeyInfo:
+        # SEQUENCE {
+        #     version INTEGER,
+        #     privateKeyAlgorithm AlgorithmIdentifier,
+        #     privateKey OCTET STRING
+        # }
+        if (
+            tuple(field.tag for field in fields)
+            != (0x02, 0x30, 0x04)
+            or decode_value(fields[0], 0x02) != 0
+        ):
+            raise ValueError(
+                "Expected PKCS#8 PrivateKeyInfo"
+            )
+
+        key = RSA.import_key(
+            private_der
+        )
+
+        if (
+            not isinstance(key, RSA.RsaKey)
+            or not key.has_private()
+            or key.size_in_bits() != _MEDIMO_SIGNING_BITS
+        ):
+            raise ValueError(
+                "Expected RSA-3072 private key"
+            )
+
+        # Do not rely solely on successful key import.
+        # Explicitly check the RSA private components.
+        key = RSA.construct(
+            (
+                key.n,
+                key.e,
+                key.d,
+                key.p,
+                key.q,
+                key.u,
+            ),
+            consistency_check=True,
+        )
+
+        _validate_signing_public_key(
+            key.public_key()
+        )
+
+    except (
+        ValueError,
+        TypeError,
+        IndexError,
+        OverflowError,
+    ):
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        ) from None
+
+    finally:
+        del private_der
+
+    # ========================================================
+    # Validate stored public key and fingerprint
+    # ========================================================
+
+    try:
+        stored_pem = row["public_key_pem"]
+
+        if (
+            not isinstance(stored_pem, str)
+            or not stored_pem.startswith(
+                "-----BEGIN PUBLIC KEY-----"
+            )
+        ):
+            raise ValueError(
+                "Invalid stored public PEM"
+            )
+
+        stored_fingerprint = (
+            signing_public_key_fingerprint(
+                stored_pem
+            )
+        )
+
+        recovered_fingerprint = (
+            signing_public_key_fingerprint(
+                key.public_key().export_key(
+                    format="DER"
+                )
+            )
+        )
+
+        stored_key = _validate_signing_public_key(
+            RSA.import_key(stored_pem)
+        )
+
+        if (
+            (key.n, key.e)
+            != (stored_key.n, stored_key.e)
+        ):
+            raise ValueError(
+                "Stored public key mismatch"
+            )
+
+        if (
+            recovered_fingerprint != row["fingerprint"]
+            or stored_fingerprint != row["fingerprint"]
+        ):
+            raise ValueError(
+                "Stored fingerprint mismatch"
+            )
+
+        # ====================================================
+        # Validate stored Medimo certificate
+        # ====================================================
+
+        certificate = parse_certificate(
+            row["certificate_der"]
+        )
+
+        certificate_key = _validate_signing_public_key(
+            RSA.import_key(
+                certificate["public_key_pem"]
+            )
+        )
+
+        if (
+            (certificate_key.n, certificate_key.e)
+            != (key.n, key.e)
+        ):
+            raise ValueError(
+                "Stored certificate public key mismatch"
+            )
+
+        certificate_fingerprint = (
+            signing_public_key_fingerprint(
+                certificate["public_key_pem"]
+            )
+        )
+
+        if certificate_fingerprint != recovered_fingerprint:
+            raise ValueError(
+                "Stored certificate fingerprint mismatch"
+            )
+
+        # Unlike external certificates, the stored Medimo
+        # certificate must follow the self-issued v3 profile.
+        #
+        # The certificate parser already validates the complete
+        # TBS structure, so use its original DER for comparison.
+        tbs = decode_value(
+            parse_der(
+                certificate["tbs_der"]
+            ),
+            0x30,
+        )
+
+        if (
+            len(tbs) < 7
+            or tbs[0].raw != b"\xa0\x03\x02\x01\x02"
+            or tbs[3].raw != tbs[5].raw
+        ):
+            raise ValueError(
+                "Expected self-issued X.509 v3 certificate"
+            )
+
+        if not rsa_verify(
+            certificate["public_key_pem"],
+            certificate["tbs_der"],
+            certificate["signature"],
+        ):
+            raise ValueError(
+                "Stored certificate self-signature mismatch"
+            )
+
+        # Validate metadata, but do not enforce the current
+        # certificate expiry policy here.
+        if (
+            certificate["not_after"]
+            != _parse_signing_timestamp(
+                row["expires_at"]
+            )
+            or certificate["not_before"]
+            != _parse_signing_timestamp(
+                row["created_at"]
+            )
+            or certificate["not_after"]
+            - certificate["not_before"]
+            != timedelta(
+                days=_SIGNING_VALIDITY_DAYS
+            )
+        ):
+            raise ValueError(
+                "Stored certificate validity mismatch"
+            )
+
+    except (
+        ValueError,
+        TypeError,
+        IndexError,
+        OverflowError,
+        InvalidSignatureError,
+        UnsupportedSignatureError,
+    ):
+        raise KeyUnlockError(
+            _SIGNING_UNLOCK_MESSAGE
+        ) from None
+
+    return key
+
+
+def unlock_signing_key(
+    user_id,
+    password,
+) -> RSA.RsaKey:
+    """Unlock an RSA signing key with atomic lockout protection."""
+
+    _signing_key_context(user_id)
+
+    if user_id > (1 << 63) - 1:
+        raise ValueError(
+            "User does not exist."
+        )
+
+    # ========================================================
+    # Phase 1: Read and check the current security state
+    # ========================================================
+
+    with closing(get_connection()) as connection:
+        with connection:
+            connection.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            snapshot = _read_signing_unlock_state(
+                connection,
+                user_id,
+            )
+
+            if snapshot is None:
+                raise KeyUnlockError(
+                    _SIGNING_UNLOCK_MESSAGE
+                )
+
+            _check_signing_unlock_state(
+                connection,
+                user_id,
+                snapshot,
+                _signing_utc_now(),
+            )
+
+    # ========================================================
+    # Phase 2: Expensive recovery outside the DB write lock
+    # ========================================================
+
+    private_key = None
+
+    try:
+        private_key = _recover_signing_private_key(
+            user_id,
+            password,
+            snapshot,
+        )
+
+    except KeyUnlockError:
+        # Expected recovery failures must be counted atomically
+        # against the latest state in the final transaction.
+        pass
+
+    # ========================================================
+    # Phase 3: Recheck and finalize the security state
+    # ========================================================
+
+    result_error = None
+
+    try:
+        with closing(get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    "BEGIN IMMEDIATE"
+                )
+
+                current = _read_signing_unlock_state(
+                    connection,
+                    user_id,
+                )
+
+                # Do not update a newly substituted or deleted key.
+                if (
+                    current is None
+                    or not _same_signing_key_material(
+                        snapshot,
+                        current,
+                    )
+                ):
+                    raise KeyUnlockError(
+                        _SIGNING_UNLOCK_MESSAGE
+                    )
+
+                now = _signing_utc_now()
+
+                # A concurrent failed attempt may have established
+                # a lockout while recovery was in progress.
+                count = _check_signing_unlock_state(
+                    connection,
+                    user_id,
+                    current,
+                    now,
+                )
+
+                if private_key is None:
+                    count = min(
+                        count + 1,
+                        _SIGNING_MAX_FAILED_ATTEMPTS,
+                    )
+
+                    if count == _SIGNING_MAX_FAILED_ATTEMPTS:
+                        locked_until = now + timedelta(
+                            minutes=_SIGNING_LOCKOUT_MINUTES
+                        )
+
+                        _update_signing_unlock_state(
+                            connection,
+                            user_id,
+                            count,
+                            locked_until.isoformat(),
+                        )
+
+                        result_error = KeyLockedError(
+                            _SIGNING_LOCKED_MESSAGE
+                        )
+
+                    else:
+                        _update_signing_unlock_state(
+                            connection,
+                            user_id,
+                            count,
+                            None,
+                        )
+
+                        result_error = KeyUnlockError(
+                            _SIGNING_UNLOCK_MESSAGE
+                        )
+
+                else:
+                    # Only a validated recovery may reset the
+                    # latest unlocked security state.
+                    _update_signing_unlock_state(
+                        connection,
+                        user_id,
+                        0,
+                        None,
+                    )
+
+    except BaseException:
+        # Never return a recovered key after a database,
+        # concurrency, lockout or transaction failure.
+        del private_key
+        raise
+
+    # Authentication errors must be raised AFTER the state
+    # update commits, otherwise SQLite rolls back the counter.
+    if result_error is not None:
+        raise result_error
+
+    return private_key
