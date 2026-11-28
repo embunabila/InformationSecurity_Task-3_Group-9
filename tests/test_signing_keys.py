@@ -3,7 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from contextlib import closing
+from contextlib import closing, ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -42,6 +42,8 @@ from signing_keys import (
     _signing_key_context,
     signing_public_key_fingerprint,
     generate_signing_keypair,
+    get_signing_key,
+    find_signer_by_fingerprint,
     rsa_sign,
     rsa_verify,
 )
@@ -226,9 +228,7 @@ class TestEMSAPKCS1v15(unittest.TestCase):
 
     def test_invalid_message_types(self):
         for message in (
-            None,
-            "abc",
-            123,
+            None, "abc", 123,
             bytearray(b"abc"),
             memoryview(b"abc"),
             True,
@@ -616,9 +616,7 @@ class TestRSAVerify(unittest.TestCase):
 
         s = pow(m, self.key.d, self.key.n)
 
-        signature = s.to_bytes(
-            self.k, "big"
-        )
+        signature = s.to_bytes(self.k, "big")
 
         self.assertEqual(
             pow(
@@ -1012,10 +1010,7 @@ class TestRSAVerify(unittest.TestCase):
     def test_inconsistent_public_components(self):
         n = 3 * ((1 << 2046) + 1)
 
-        self.assertEqual(
-            n.bit_length(),
-            2048,
-        )
+        self.assertEqual(n.bit_length(), 2048)
 
         self.assertIs(
             rsa_verify(
@@ -1099,10 +1094,7 @@ class TestRSAVerify(unittest.TestCase):
                 "No leading-zero signature found within search limit"
             )
 
-        self.assertEqual(
-            len(signature),
-            self.k,
-        )
+        self.assertEqual(len(signature), self.k)
 
         self.assertIs(
             rsa_verify(
@@ -1193,10 +1185,7 @@ class TestRSAVerify(unittest.TestCase):
                 em = (
                     b"\x00\x01"
                     + b"\xff" * (
-                        self.k
-                        - len(t)
-                        - len(garbage)
-                        - 3
+                        self.k - len(t) - len(garbage) - 3
                     )
                     + b"\x00"
                     + t
@@ -1231,7 +1220,6 @@ class TestRSAVerify(unittest.TestCase):
             ABSENT_PREFIX,
         ):
             em = self.independent_em(prefix)
-
             signature = self.raw_sign_em(em)
 
             with self.subTest(prefix=prefix):
@@ -1328,15 +1316,8 @@ class TestSigningKeyHelpers(unittest.TestCase):
     def test_fingerprint_non_byte_aligned(self):
         key = self.keys[2049].public_key()
 
-        self.assertEqual(
-            key.size_in_bits(),
-            2049,
-        )
-
-        self.assertEqual(
-            key.size_in_bytes(),
-            257,
-        )
+        self.assertEqual(key.size_in_bits(), 2049)
+        self.assertEqual(key.size_in_bytes(), 257)
 
         self.assertEqual(
             len(
@@ -1395,7 +1376,6 @@ class TestSigningKeyHelpers(unittest.TestCase):
 
             if size < 128:
                 length = bytes([size])
-
             else:
                 raw = size.to_bytes(
                     (size.bit_length() + 7) // 8,
@@ -1439,9 +1419,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
 
         for representation in representations:
             with self.subTest(
-                input_type=type(
-                    representation
-                ).__name__
+                input_type=type(representation).__name__
             ):
                 self.assertEqual(
                     signing_public_key_fingerprint(
@@ -1576,10 +1554,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
             self.assertIsInstance(salt, bytes)
             self.assertEqual(len(salt), 16)
 
-        self.assertEqual(
-            len(set(salts)),
-            3,
-        )
+        self.assertEqual(len(set(salts)), 3)
 
     def test_kek_deterministic_known_answer(self):
         expected = bytes.fromhex(
@@ -1710,7 +1685,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
 
 
 # ============================================================
-# Stage 5b: Signing-key generation tests
+# Stage 5b: Existing signing-key generation tests
 # ============================================================
 
 
@@ -1722,8 +1697,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # All accounts are dummy test accounts.
-        # Reuse the real login password hash to reduce setup time.
         cls.password_hash = generate_password_hash(
             cls.PASSWORD,
             method="scrypt:131072:8:1",
@@ -1736,7 +1709,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
-
         self.addCleanup(directory.cleanup)
 
         self.db_path = (
@@ -1753,7 +1725,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
         db_patcher.start()
         self.addCleanup(db_patcher.stop)
 
-        # Use the real application schema.
         db.init_db()
 
         self.execute(
@@ -1777,10 +1748,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
         with closing(db.get_connection()) as connection:
             with connection:
-                connection.execute(
-                    sql,
-                    parameters,
-                )
+                connection.execute(sql, parameters)
 
     def read_signing_row(self):
         with closing(db.get_connection()) as connection:
@@ -1830,7 +1798,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
         return row
 
     def recover_private_der(self, row):
-        # Explicit independent context fixture.
         context = {
             "owner_id": self.USER_ID,
             "kind": "signing_key",
@@ -1848,10 +1815,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             "AES",
             context,
         )
-
-    # ========================================================
-    # Successful generation and storage
-    # ========================================================
 
     def test_successful_generation_and_initial_storage(self):
         row = self.generate()
@@ -1877,18 +1840,9 @@ class TestGenerateSigningKeypair(unittest.TestCase):
         )
 
         self.assertFalse(public_key.has_private())
+        self.assertEqual(public_key.size_in_bits(), 3072)
+        self.assertEqual(public_key.size_in_bytes(), 384)
 
-        self.assertEqual(
-            public_key.size_in_bits(),
-            3072,
-        )
-
-        self.assertEqual(
-            public_key.size_in_bytes(),
-            384,
-        )
-
-        # Independently derive the expected fingerprint.
         expected_hex = SHA256.new(
             public_key.export_key(format="DER")
         ).hexdigest().upper()
@@ -1903,10 +1857,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             expected_fingerprint,
         )
 
-        self.assertEqual(
-            len(row["fingerprint"]),
-            79,
-        )
+        self.assertEqual(len(row["fingerprint"]), 79)
 
         self.assertIsInstance(
             row["certificate_der"],
@@ -1944,13 +1895,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             0,
         )
 
-        self.assertIsNone(
-            row["locked_until"]
-        )
-
-        self.assertIsNone(
-            self.read_encryption_row()
-        )
+        self.assertIsNone(row["locked_until"])
+        self.assertIsNone(self.read_encryption_row())
 
         expected_columns = {
             "user_id",
@@ -1980,8 +1926,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             ).fetchone()[0]
 
         self.assertEqual(count, 1)
-
-        # Audit responsibility belongs to the caller.
         self.assertEqual(audit_count, 0)
 
     def test_certificate_consistency_and_self_signature(self):
@@ -2029,7 +1973,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             )
         )
 
-        # Independent signature verification.
         pkcs1_15.new(
             certificate_key
         ).verify(
@@ -2062,16 +2005,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
         for value in (created_at, expires_at):
             self.assertIsNotNone(value.tzinfo)
-
-            self.assertEqual(
-                value.utcoffset(),
-                timedelta(0),
-            )
-
-            self.assertEqual(
-                value.microsecond,
-                0,
-            )
+            self.assertEqual(value.utcoffset(), timedelta(0))
+            self.assertEqual(value.microsecond, 0)
 
         self.assertTrue(
             row["created_at"].endswith("+00:00")
@@ -2086,13 +2021,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
         private_der = self.recover_private_der(row)
 
-        self.assertIsInstance(
-            private_der,
-            bytes,
-        )
+        self.assertIsInstance(private_der, bytes)
 
-        # PKCS#8 PrivateKeyInfo has version,
-        # AlgorithmIdentifier and privateKey OCTET STRING.
         fields = decode_value(
             parse_der(private_der),
             0x30,
@@ -2114,14 +2044,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             row["public_key_pem"]
         )
 
-        self.assertTrue(
-            recovered.has_private()
-        )
-
-        self.assertEqual(
-            recovered.size_in_bits(),
-            3072,
-        )
+        self.assertTrue(recovered.has_private())
+        self.assertEqual(recovered.size_in_bits(), 3072)
 
         self.assertEqual(
             (recovered.n, recovered.e),
@@ -2143,7 +2067,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             row["encrypted_private_key"],
         )
 
-        # The recovered key can actually sign.
         message = b"Recovered signing key test"
 
         signature = rsa_sign(
@@ -2158,10 +2081,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
                 signature,
             )
         )
-
-    # ========================================================
-    # Encryption and key separation
-    # ========================================================
 
     def test_wrong_kek_cannot_decrypt_private_key(self):
         row = self.generate()
@@ -2207,9 +2126,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
         for context in wrong_contexts:
             with self.subTest(context=context):
-                with self.assertRaises(
-                    InvalidEnvelopeError
-                ):
+                with self.assertRaises(InvalidEnvelopeError):
                     decrypt_blob(
                         row["encrypted_private_key"],
                         kek,
@@ -2218,7 +2135,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
                     )
 
     def test_task2_key_and_lockout_state_remain_separate(self):
-        # Generate a genuine Task 2 encryption keypair.
         generate_user_keypair(
             self.USER_ID,
             self.PASSWORD,
@@ -2248,7 +2164,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             self.read_encryption_row()
         )
 
-        # All legacy fields must remain unchanged.
         self.assertEqual(
             legacy_before,
             legacy_after,
@@ -2262,15 +2177,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             signing["public_key_pem"]
         )
 
-        self.assertEqual(
-            encryption_key.size_in_bits(),
-            3072,
-        )
-
-        self.assertEqual(
-            signing_key.size_in_bits(),
-            3072,
-        )
+        self.assertEqual(encryption_key.size_in_bits(), 3072)
+        self.assertEqual(signing_key.size_in_bits(), 3072)
 
         self.assertNotEqual(
             encryption_key.n,
@@ -2302,10 +2210,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             signing["private_key_salt"],
         )
 
-        self.assertNotEqual(
-            legacy_kek,
-            signing_kek,
-        )
+        self.assertNotEqual(legacy_kek, signing_kek)
 
         with self.assertRaises(InvalidEnvelopeError):
             decrypt_blob(
@@ -2330,13 +2235,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             0,
         )
 
-        self.assertIsNone(
-            signing["locked_until"]
-        )
-
-    # ========================================================
-    # Account validation
-    # ========================================================
+        self.assertIsNone(signing["locked_until"])
 
     def test_wrong_and_invalid_passwords_rejected(self):
         passwords = (
@@ -2349,7 +2248,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             "\ud800",
         )
 
-        # Expensive RSA generation must not occur.
         with patch(
             "signing_keys.RSA.generate",
             side_effect=AssertionError(
@@ -2373,14 +2271,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
     def test_invalid_and_nonexistent_user_ids(self):
         values = (
-            None,
-            True,
-            False,
-            0,
-            -1,
-            "7",
-            7.0,
-            b"7",
+            None, True, False,
+            0, -1, "7", 7.0, b"7",
             999999,
             1 << 63,
         )
@@ -2405,9 +2297,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
         self.assert_no_signing_key()
 
     def test_duplicate_signing_key_generation_rejected(self):
-        original = dict(
-            self.generate()
-        )
+        original = dict(self.generate())
 
         with patch(
             "signing_keys.RSA.generate",
@@ -2432,15 +2322,8 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             original,
         )
 
-    # ========================================================
-    # Concurrent account and key changes
-    # ========================================================
-
     def test_concurrent_duplicate_created_during_generation(self):
-        # Prepare a genuine competing signing-key record.
-        competitor = dict(
-            self.generate()
-        )
+        competitor = dict(self.generate())
 
         self.execute(
             """
@@ -2456,8 +2339,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             not_before,
             not_after,
         ):
-            # A separate connection must be able to write while
-            # the original request is generating key material.
             self.execute(
                 """
                 INSERT INTO signing_keys (
@@ -2508,7 +2389,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
                     self.PASSWORD,
                 )
 
-        # The first successful record must never be overwritten.
         self.assertEqual(
             dict(self.read_signing_row()),
             competitor,
@@ -2654,10 +2534,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
         self.assert_no_signing_key()
 
-    # ========================================================
-    # Failure injection and certificate consistency
-    # ========================================================
-
     def test_certificate_generation_failure_no_partial_key(self):
         with patch(
             "signing_keys.build_self_signed_certificate",
@@ -2695,9 +2571,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
         self.assert_no_signing_key()
 
     def test_database_insert_failure_rolls_back(self):
-        # SQLite RAISE(FAIL) does not necessarily undo earlier
-        # changes made by the statement. Transaction rollback
-        # must remove the inserted row.
         self.execute(
             """
             CREATE TRIGGER test_fail_signing_insert
@@ -2722,8 +2595,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
 
         self.assert_no_signing_key()
 
-        # Remove the failure injection and verify that the DB
-        # remains usable after the failed transaction.
         self.execute(
             "DROP TRIGGER test_fail_signing_insert"
         )
@@ -2744,8 +2615,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             not_before,
             not_after,
         ):
-            # Produce a genuine self-signed certificate, but
-            # with a different RSA keypair.
             self.assertNotEqual(
                 private_key.n,
                 other_private_key.n,
@@ -2787,8 +2656,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
                 not_after,
             )
 
-            # The final byte belongs to the signature BIT STRING.
-            # Preserve structure but alter the signature.
             modified = (
                 certificate[:-1]
                 + bytes([certificate[-1] ^ 1])
@@ -2822,9 +2689,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
         self.assert_no_signing_key()
 
     def test_primary_key_constraint_failure_is_duplicate_error(self):
-        # Inject a primary-key collision after the application's
-        # duplicate check but before the original INSERT succeeds.
-        # Use a different fingerprint to isolate the PK constraint.
         self.execute(
             """
             CREATE TRIGGER test_signing_pk_collision
@@ -2868,13 +2732,7 @@ class TestGenerateSigningKeypair(unittest.TestCase):
                 self.PASSWORD,
             )
 
-        # Neither the injected record nor the original record
-        # may survive the failed transaction.
         self.assert_no_signing_key()
-
-    # ========================================================
-    # Time boundaries and immediate signing
-    # ========================================================
 
     def test_leap_year_timestamp_and_immediate_signing(self):
         generation_time = datetime(
@@ -2933,8 +2791,6 @@ class TestGenerateSigningKeypair(unittest.TestCase):
             "2030-02-28T23:59:59+00:00",
         )
 
-        # Signing immediately in the same second must not
-        # fall before the certificate validity interval.
         immediate_signing_time = generation_time.replace(
             microsecond=0
         )
@@ -2963,6 +2819,984 @@ class TestGenerateSigningKeypair(unittest.TestCase):
                 signature,
             )
         )
+
+
+# ============================================================
+# Stage 5c: Public retrieval and signer lookup tests
+# ============================================================
+
+
+class TestSigningKeyRetrieval(unittest.TestCase):
+
+    USER_ID = 7
+    USERNAME = "signing_test_user"
+
+    EXPIRED_USER_ID = 8
+    EXPIRED_USERNAME = "expired_signing_user"
+
+    TASK2_USER_ID = 9
+    TASK2_USERNAME = "encryption_only_user"
+
+    PASSWORD = "Medimo-Retrieval-Test"
+
+    @classmethod
+    def setUpClass(cls):
+        """Create real cryptographic fixtures only once."""
+
+        directory = tempfile.TemporaryDirectory()
+
+        cls.addClassCleanup(directory.cleanup)
+
+        cls.seed_path = (
+            Path(directory.name)
+            / "seed_signing_keys.db"
+        )
+
+        password_hash = generate_password_hash(
+            cls.PASSWORD,
+            method="scrypt:131072:8:1",
+        )
+
+        with patch.object(
+            db,
+            "DB_PATH",
+            cls.seed_path,
+        ):
+            db.init_db()
+
+            with closing(db.get_connection()) as connection:
+                with connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO users (
+                            id,
+                            username,
+                            password_hash
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            (
+                                cls.USER_ID,
+                                cls.USERNAME,
+                                password_hash,
+                            ),
+                            (
+                                cls.EXPIRED_USER_ID,
+                                cls.EXPIRED_USERNAME,
+                                password_hash,
+                            ),
+                            (
+                                cls.TASK2_USER_ID,
+                                cls.TASK2_USERNAME,
+                                password_hash,
+                            ),
+                        ),
+                    )
+
+            generate_signing_keypair(
+                cls.USER_ID,
+                cls.PASSWORD,
+            )
+
+            # Generate an actual historical certificate,
+            # rather than altering only expires_at.
+            with patch(
+                "signing_keys._signing_utc_now",
+                return_value=datetime(
+                    2000, 1, 1,
+                    tzinfo=timezone.utc,
+                ),
+            ):
+                generate_signing_keypair(
+                    cls.EXPIRED_USER_ID,
+                    cls.PASSWORD,
+                )
+
+            generate_user_keypair(
+                cls.TASK2_USER_ID,
+                cls.PASSWORD,
+            )
+
+            with closing(db.get_connection()) as connection:
+                cls.first_row = dict(
+                    connection.execute(
+                        """
+                        SELECT *
+                        FROM signing_keys
+                        WHERE user_id = ?
+                        """,
+                        (cls.USER_ID,),
+                    ).fetchone()
+                )
+
+                cls.expired_row = dict(
+                    connection.execute(
+                        """
+                        SELECT *
+                        FROM signing_keys
+                        WHERE user_id = ?
+                        """,
+                        (cls.EXPIRED_USER_ID,),
+                    ).fetchone()
+                )
+
+                cls.task2_row = dict(
+                    connection.execute(
+                        """
+                        SELECT *
+                        FROM user_keys
+                        WHERE user_id = ?
+                        """,
+                        (cls.TASK2_USER_ID,),
+                    ).fetchone()
+                )
+
+        cls.fingerprint = cls.first_row["fingerprint"]
+        cls.expired_fingerprint = cls.expired_row["fingerprint"]
+        cls.task2_fingerprint = cls.task2_row["fingerprint"]
+
+        cls.unknown_fingerprint = next(
+            candidate
+            for candidate in (
+                " ".join([f"{number:04X}"] * 16)
+                for number in range(65536)
+            )
+            if candidate not in {
+                cls.fingerprint,
+                cls.expired_fingerprint,
+                cls.task2_fingerprint,
+            }
+        )
+
+    def setUp(self):
+        """Each test receives an independent copy of the seed DB."""
+
+        directory = tempfile.TemporaryDirectory()
+
+        self.addCleanup(directory.cleanup)
+
+        self.db_path = (
+            Path(directory.name)
+            / "test_retrieval.db"
+        )
+
+        with closing(
+            sqlite3.connect(self.seed_path)
+        ) as source:
+
+            with closing(
+                sqlite3.connect(self.db_path)
+            ) as destination:
+
+                source.backup(destination)
+
+        db_patcher = patch.object(
+            db,
+            "DB_PATH",
+            self.db_path,
+        )
+
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+
+    def execute(self, sql, parameters=()):
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(sql, parameters)
+
+    def public_fields(self, row):
+        return {
+            "public_key_pem": row["public_key_pem"],
+            "fingerprint": row["fingerprint"],
+            "certificate_der": row["certificate_der"],
+            "expires_at": row["expires_at"],
+        }
+
+    def snapshot(self):
+        """Capture relevant database state for read-only tests."""
+
+        queries = (
+            (
+                "users",
+                "SELECT * FROM users ORDER BY id",
+            ),
+            (
+                "signing_keys",
+                "SELECT * FROM signing_keys ORDER BY user_id",
+            ),
+            (
+                "user_keys",
+                "SELECT * FROM user_keys ORDER BY user_id",
+            ),
+            (
+                "signature_audit_log",
+                "SELECT * FROM signature_audit_log ORDER BY id",
+            ),
+            (
+                "document_signatures",
+                "SELECT * FROM document_signatures ORDER BY id",
+            ),
+        )
+
+        with closing(db.get_connection()) as connection:
+            return {
+                name: [
+                    dict(row)
+                    for row in connection.execute(sql).fetchall()
+                ]
+                for name, sql in queries
+            }
+
+    # ========================================================
+    # get_signing_key
+    # ========================================================
+
+    def test_get_signing_key_exact_fields_and_types(self):
+        result = get_signing_key(self.USER_ID)
+
+        self.assertIs(type(result), dict)
+
+        expected_types = {
+            "public_key_pem": str,
+            "fingerprint": str,
+            "certificate_der": bytes,
+            "expires_at": str,
+        }
+
+        self.assertEqual(
+            set(result),
+            set(expected_types),
+        )
+
+        for name, expected_type in expected_types.items():
+            with self.subTest(field=name):
+                self.assertIs(
+                    type(result[name]),
+                    expected_type,
+                )
+
+        self.assertEqual(
+            result,
+            self.public_fields(self.first_row),
+        )
+
+        self.assertTrue(
+            result["public_key_pem"].startswith(
+                "-----BEGIN PUBLIC KEY-----"
+            )
+        )
+
+        self.assertEqual(
+            signing_public_key_fingerprint(
+                result["public_key_pem"]
+            ),
+            result["fingerprint"],
+        )
+
+        parsed = parse_certificate(
+            result["certificate_der"]
+        )
+
+        expires_at = datetime.fromisoformat(
+            result["expires_at"]
+        )
+
+        self.assertEqual(
+            expires_at,
+            parsed["not_after"],
+        )
+
+        self.assertEqual(
+            expires_at.utcoffset(),
+            timedelta(0),
+        )
+
+        self.assertTrue(
+            result["expires_at"].endswith("+00:00")
+        )
+
+    def test_get_signing_key_preserves_raw_certificate(self):
+        expected = self.first_row["certificate_der"]
+
+        actual = get_signing_key(
+            self.USER_ID
+        )["certificate_der"]
+
+        self.assertIs(type(actual), bytes)
+        self.assertEqual(actual, expected)
+
+        self.assertEqual(
+            parse_der(actual).raw,
+            expected,
+        )
+
+    def test_get_signing_key_missing_and_nonexistent(self):
+        # Existing account with a Task 2 key, but no signing key.
+        self.assertIsNone(
+            get_signing_key(self.TASK2_USER_ID)
+        )
+
+        # Valid user ID that is absent from the database.
+        self.assertIsNone(
+            get_signing_key(999999)
+        )
+
+        # Largest representable SQLite INTEGER.
+        self.assertIsNone(
+            get_signing_key((1 << 63) - 1)
+        )
+
+    def test_get_signing_key_invalid_user_ids(self):
+        values = (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            "7",
+            b"7",
+            7.0,
+            object(),
+            1 << 63,
+            10**100,
+            "7 OR 1=1",
+        )
+
+        with patch(
+            "signing_keys.get_connection",
+            side_effect=AssertionError(
+                "Invalid input must not reach the database"
+            ),
+        ) as connection_factory:
+
+            for user_id in values:
+                with self.subTest(user_id=user_id):
+                    with self.assertRaises(ValueError):
+                        get_signing_key(user_id)
+
+            connection_factory.assert_not_called()
+
+    def test_expired_signing_key_remains_retrievable(self):
+        result = get_signing_key(
+            self.EXPIRED_USER_ID
+        )
+
+        self.assertEqual(
+            result,
+            self.public_fields(self.expired_row),
+        )
+
+        parsed = parse_certificate(
+            result["certificate_der"]
+        )
+
+        expires_at = datetime.fromisoformat(
+            result["expires_at"]
+        )
+
+        self.assertEqual(
+            expires_at,
+            parsed["not_after"],
+        )
+
+        self.assertLess(
+            expires_at,
+            datetime.now(timezone.utc),
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                parsed["public_key_pem"],
+                parsed["tbs_der"],
+                parsed["signature"],
+            )
+        )
+
+    def test_locked_signing_key_remains_retrievable(self):
+        locked_until = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=15)
+        ).isoformat()
+
+        self.execute(
+            """
+            UPDATE signing_keys
+            SET failed_unlock_count = 5,
+                locked_until = ?
+            WHERE user_id = ?
+            """,
+            (locked_until, self.USER_ID),
+        )
+
+        before = self.snapshot()
+
+        result = get_signing_key(
+            self.USER_ID
+        )
+
+        self.assertEqual(
+            result,
+            self.public_fields(self.first_row),
+        )
+
+        self.assertNotIn(
+            "failed_unlock_count",
+            result,
+        )
+
+        self.assertNotIn(
+            "locked_until",
+            result,
+        )
+
+        self.assertEqual(
+            self.snapshot(),
+            before,
+        )
+
+    def test_public_reads_do_not_use_cryptographic_operations(self):
+        forbidden_calls = (
+            "signing_keys._derive_signing_kek",
+            "signing_keys.scrypt",
+            "signing_keys.encrypt_blob",
+            "crypto_core.decrypt_blob",
+            "signing_keys.check_password_hash",
+            "signing_keys.RSA.generate",
+            "signing_keys.RSA.import_key",
+            "signing_keys.rsa_verify",
+            "signing_keys.rsa_sign",
+            "signing_keys.parse_certificate",
+            "signing_keys.signing_public_key_fingerprint",
+        )
+
+        with ExitStack() as stack:
+            mocks = [
+                stack.enter_context(
+                    patch(
+                        name,
+                        side_effect=AssertionError(
+                            f"Unexpected public-read operation: {name}"
+                        ),
+                    )
+                )
+                for name in forbidden_calls
+            ]
+
+            self.assertEqual(
+                get_signing_key(self.USER_ID),
+                self.public_fields(self.first_row),
+            )
+
+            self.assertEqual(
+                find_signer_by_fingerprint(
+                    self.fingerprint
+                ),
+                {
+                    "user_id": self.USER_ID,
+                    "username": self.USERNAME,
+                },
+            )
+
+            self.assertIsNone(
+                get_signing_key(self.TASK2_USER_ID)
+            )
+
+            self.assertIsNone(
+                find_signer_by_fingerprint(
+                    self.unknown_fingerprint
+                )
+            )
+
+            for mocked in mocks:
+                mocked.assert_not_called()
+
+    def test_public_reads_do_not_change_database_state(self):
+        before = self.snapshot()
+
+        for _ in range(3):
+            get_signing_key(self.USER_ID)
+            get_signing_key(self.EXPIRED_USER_ID)
+            get_signing_key(self.TASK2_USER_ID)
+            get_signing_key(999999)
+
+            find_signer_by_fingerprint(
+                self.fingerprint
+            )
+
+            find_signer_by_fingerprint(
+                self.expired_fingerprint
+            )
+
+            find_signer_by_fingerprint(
+                self.task2_fingerprint
+            )
+
+            find_signer_by_fingerprint(
+                self.unknown_fingerprint
+            )
+
+        after = self.snapshot()
+
+        self.assertEqual(after, before)
+
+        self.assertEqual(
+            len(after["signature_audit_log"]),
+            0,
+        )
+
+    # ========================================================
+    # find_signer_by_fingerprint
+    # ========================================================
+
+    def test_find_signer_exact_fields_and_types(self):
+        result = find_signer_by_fingerprint(
+            self.fingerprint
+        )
+
+        self.assertIs(type(result), dict)
+
+        self.assertEqual(
+            set(result),
+            {"user_id", "username"},
+        )
+
+        self.assertIs(
+            type(result["user_id"]),
+            int,
+        )
+
+        self.assertIs(
+            type(result["username"]),
+            str,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "user_id": self.USER_ID,
+                "username": self.USERNAME,
+            },
+        )
+
+    def test_unknown_fingerprint_returns_none(self):
+        self.assertRegex(
+            self.unknown_fingerprint,
+            r"\A[0-9A-F]{4}( [0-9A-F]{4}){15}\Z",
+        )
+
+        self.assertIsNone(
+            find_signer_by_fingerprint(
+                self.unknown_fingerprint
+            )
+        )
+
+    def test_invalid_fingerprint_inputs(self):
+        canonical = " ".join(["ABCD"] * 16)
+
+        values = (
+            None,
+            True,
+            False,
+            123,
+            object(),
+            canonical.encode("ascii"),
+            bytearray(canonical.encode("ascii")),
+            "",
+            " ",
+            "ABCD",
+            canonical.lower(),
+            canonical.replace(" ", ""),
+            canonical.replace(" ", "  ", 1),
+            canonical.replace(" ", "\t", 1),
+            canonical.replace(" ", "\n", 1),
+            " " + canonical,
+            canonical + " ",
+            canonical + "\n",
+            canonical[:-1],
+            canonical + "A",
+            "G" + canonical[1:],
+            "Ａ" + canonical[1:],
+            "'" + canonical[1:],
+            "' OR 1=1 --",
+            "\x00" + canonical[1:],
+            "A" * 10000,
+        )
+
+        with patch(
+            "signing_keys.get_connection",
+            side_effect=AssertionError(
+                "Malformed fingerprint must not reach the database"
+            ),
+        ) as connection_factory:
+
+            for index, value in enumerate(values):
+                with self.subTest(case=index):
+                    with self.assertRaises(ValueError):
+                        find_signer_by_fingerprint(value)
+
+            connection_factory.assert_not_called()
+
+    def test_fingerprint_lookup_multiple_users(self):
+        cases = (
+            (
+                self.fingerprint,
+                self.USER_ID,
+                self.USERNAME,
+            ),
+            (
+                self.expired_fingerprint,
+                self.EXPIRED_USER_ID,
+                self.EXPIRED_USERNAME,
+            ),
+        )
+
+        self.assertNotEqual(
+            self.fingerprint,
+            self.expired_fingerprint,
+        )
+
+        for fingerprint, user_id, username in cases:
+            with self.subTest(user_id=user_id):
+                self.assertEqual(
+                    find_signer_by_fingerprint(
+                        fingerprint
+                    ),
+                    {
+                        "user_id": user_id,
+                        "username": username,
+                    },
+                )
+
+    def test_task2_fingerprint_not_found_by_signing_lookup(self):
+        self.assertEqual(
+            public_key_fingerprint(
+                self.task2_row["public_key_pem"]
+            ),
+            self.task2_fingerprint,
+        )
+
+        # The fingerprint algorithm is compatible,
+        # but the storage domain is separate.
+        self.assertEqual(
+            signing_public_key_fingerprint(
+                self.task2_row["public_key_pem"]
+            ),
+            self.task2_fingerprint,
+        )
+
+        self.assertNotIn(
+            self.task2_fingerprint,
+            (
+                self.fingerprint,
+                self.expired_fingerprint,
+            ),
+        )
+
+        self.assertIsNone(
+            find_signer_by_fingerprint(
+                self.task2_fingerprint
+            )
+        )
+
+        self.assertIsNone(
+            get_signing_key(self.TASK2_USER_ID)
+        )
+
+    def test_lookup_uses_current_database_username(self):
+        certificate = parse_certificate(
+            self.first_row["certificate_der"]
+        )
+
+        self.assertEqual(
+            certificate["subject_cn"],
+            self.USERNAME,
+        )
+
+        new_username = "renamed_registered_user"
+
+        self.execute(
+            """
+            UPDATE users
+            SET username = ?
+            WHERE id = ?
+            """,
+            (new_username, self.USER_ID),
+        )
+
+        signer = find_signer_by_fingerprint(
+            self.fingerprint
+        )
+
+        self.assertEqual(
+            signer,
+            {
+                "user_id": self.USER_ID,
+                "username": new_username,
+            },
+        )
+
+        self.assertNotEqual(
+            signer["username"],
+            certificate["subject_cn"],
+        )
+
+        self.assertEqual(
+            get_signing_key(
+                self.USER_ID
+            )["certificate_der"],
+            self.first_row["certificate_der"],
+        )
+
+    def test_lookup_expired_signing_certificate(self):
+        expires_at = datetime.fromisoformat(
+            self.expired_row["expires_at"]
+        )
+
+        self.assertLess(
+            expires_at,
+            datetime.now(timezone.utc),
+        )
+
+        result = find_signer_by_fingerprint(
+            self.expired_fingerprint
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "user_id": self.EXPIRED_USER_ID,
+                "username": self.EXPIRED_USERNAME,
+            },
+        )
+
+    # ========================================================
+    # SQL safety and database connection lifecycle
+    # ========================================================
+
+    def test_parameterized_queries_and_public_columns_only(self):
+        class TrackingConnection(sqlite3.Connection):
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.calls = []
+
+            def execute(self, sql, parameters=()):
+                self.calls.append(
+                    (sql, tuple(parameters))
+                )
+
+                return super().execute(
+                    sql,
+                    parameters,
+                )
+
+        cases = (
+            (
+                get_signing_key,
+                self.USER_ID,
+                self.public_fields(self.first_row),
+                {
+                    ("signing_keys", "user_id"),
+                    ("signing_keys", "public_key_pem"),
+                    ("signing_keys", "fingerprint"),
+                    ("signing_keys", "certificate_der"),
+                    ("signing_keys", "expires_at"),
+                },
+            ),
+            (
+                find_signer_by_fingerprint,
+                self.fingerprint,
+                {
+                    "user_id": self.USER_ID,
+                    "username": self.USERNAME,
+                },
+                {
+                    ("signing_keys", "user_id"),
+                    ("signing_keys", "fingerprint"),
+                    ("users", "id"),
+                    ("users", "username"),
+                },
+            ),
+        )
+
+        for function, argument, expected, allowed in cases:
+            with self.subTest(
+                function=function.__name__
+            ):
+                connection = sqlite3.connect(
+                    self.db_path,
+                    factory=TrackingConnection,
+                )
+
+                self.addCleanup(connection.close)
+
+                connection.row_factory = sqlite3.Row
+
+                def authorizer(
+                    action, table, column, database, source
+                ):
+                    if action == sqlite3.SQLITE_SELECT:
+                        return sqlite3.SQLITE_OK
+
+                    if action == sqlite3.SQLITE_READ:
+                        if (table, column) in allowed:
+                            return sqlite3.SQLITE_OK
+
+                    # Reject unrelated columns and all writes.
+                    return sqlite3.SQLITE_DENY
+
+                connection.set_authorizer(authorizer)
+
+                with patch(
+                    "signing_keys.get_connection",
+                    return_value=connection,
+                ):
+                    result = function(argument)
+
+                self.assertEqual(result, expected)
+
+                self.assertEqual(
+                    len(connection.calls),
+                    1,
+                )
+
+                sql, parameters = connection.calls[0]
+
+                self.assertIn("?", sql)
+
+                self.assertEqual(
+                    parameters,
+                    (argument,),
+                )
+
+                self.assertNotIn(
+                    "SELECT *",
+                    " ".join(sql.upper().split()),
+                )
+
+                with self.assertRaises(
+                    sqlite3.ProgrammingError
+                ):
+                    connection.execute("SELECT 1")
+
+    def test_database_failure_propagates_and_closes_connection(self):
+        # A real SQLite error: required table is missing.
+        self.execute(
+            "DROP TABLE signing_keys"
+        )
+
+        cases = (
+            (get_signing_key, self.USER_ID),
+            (
+                find_signer_by_fingerprint,
+                self.fingerprint,
+            ),
+        )
+
+        for function, argument in cases:
+            with self.subTest(
+                function=function.__name__
+            ):
+                connection = db.get_connection()
+
+                self.addCleanup(connection.close)
+
+                with patch(
+                    "signing_keys.get_connection",
+                    return_value=connection,
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.OperationalError,
+                        "no such table",
+                    ):
+                        function(argument)
+
+                # Connection must be closed even if SELECT failed.
+                with self.assertRaises(
+                    sqlite3.ProgrammingError
+                ):
+                    connection.execute("SELECT 1")
+
+    def test_connection_cleanup_on_success_and_missing_record(self):
+        cases = (
+            (
+                get_signing_key,
+                self.USER_ID,
+                self.public_fields(self.first_row),
+            ),
+            (
+                get_signing_key,
+                self.TASK2_USER_ID,
+                None,
+            ),
+            (
+                find_signer_by_fingerprint,
+                self.fingerprint,
+                {
+                    "user_id": self.USER_ID,
+                    "username": self.USERNAME,
+                },
+            ),
+            (
+                find_signer_by_fingerprint,
+                self.unknown_fingerprint,
+                None,
+            ),
+        )
+
+        for function, argument, expected in cases:
+            with self.subTest(
+                function=function.__name__,
+                found=expected is not None,
+            ):
+                connection = db.get_connection()
+
+                self.addCleanup(connection.close)
+
+                with patch(
+                    "signing_keys.get_connection",
+                    return_value=connection,
+                ) as factory:
+
+                    result = function(argument)
+
+                factory.assert_called_once_with()
+
+                self.assertEqual(
+                    result,
+                    expected,
+                )
+
+                with self.assertRaises(
+                    sqlite3.ProgrammingError
+                ):
+                    connection.execute("SELECT 1")
+
+    def test_database_connection_failure_propagates(self):
+        cases = (
+            (get_signing_key, self.USER_ID),
+            (
+                find_signer_by_fingerprint,
+                self.fingerprint,
+            ),
+        )
+
+        for function, argument in cases:
+            with self.subTest(
+                function=function.__name__
+            ):
+                with patch(
+                    "signing_keys.get_connection",
+                    side_effect=sqlite3.OperationalError(
+                        "Injected database connection failure"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.OperationalError,
+                        "Injected database connection failure",
+                    ):
+                        function(argument)
 
 
 if __name__ == "__main__":

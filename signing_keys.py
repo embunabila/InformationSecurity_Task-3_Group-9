@@ -1,6 +1,7 @@
 """Medimo RSA signing, verification and signing-key management."""
 
 import hmac
+import re
 import sqlite3
 
 from contextlib import closing
@@ -320,7 +321,6 @@ def signing_public_key_fingerprint(public_key) -> str:
             else public_key
         )
 
-        # Required for raw DER inputs.
         marker = None
 
         if raw.lstrip().startswith(b"-----BEGIN "):
@@ -516,7 +516,6 @@ def _validate_generated_certificate(
         certificate_key
     )
 
-    # Match the certificate against the actual generated key.
     if (
         certificate_key.n != private_key.n
         or certificate_key.e != private_key.e
@@ -563,16 +562,13 @@ def generate_signing_keypair(user_id, password) -> None:
 
     context = _signing_key_context(user_id)
 
-    # SQLite INTEGER PRIMARY KEY uses signed 64-bit integers.
     if user_id > (1 << 63) - 1:
         raise ValueError("User does not exist.")
 
     if not isinstance(password, str) or not password:
         raise KeyUnlockError("Password verification failed.")
 
-    # ========================================================
-    # Phase 1: Account and duplicate validation
-    # ========================================================
+    # Phase 1: Account and duplicate validation.
 
     with closing(get_connection()) as connection:
         user = _read_signing_account(
@@ -607,9 +603,7 @@ def generate_signing_keypair(user_id, password) -> None:
             "Password verification failed."
         )
 
-    # ========================================================
-    # Phase 2: Generate all key material without a DB write lock
-    # ========================================================
+    # Phase 2: Generate key material without a database write lock.
 
     private_key = RSA.generate(
         _MEDIMO_SIGNING_BITS
@@ -653,7 +647,6 @@ def generate_signing_keypair(user_id, password) -> None:
         finally:
             del kek
 
-        # Use one UTC timestamp, truncated to whole seconds.
         not_before = _signing_utc_now().replace(
             microsecond=0
         )
@@ -679,23 +672,18 @@ def generate_signing_keypair(user_id, password) -> None:
         )
 
     finally:
-        # Release references, not a guarantee of secure zeroization.
         del private_key
 
     created_at = not_before.isoformat()
     expires_at = not_after.isoformat()
 
-    # ========================================================
-    # Phase 3: Atomic database persistence
-    # ========================================================
+    # Phase 3: Atomic database persistence.
 
     with closing(get_connection()) as connection:
         try:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
 
-                # A concurrent request may have generated a key
-                # while this request was performing RSA or scrypt.
                 if _signing_key_exists(connection, user_id):
                     raise ValueError(
                         "User already has a signing keypair."
@@ -706,7 +694,6 @@ def generate_signing_keypair(user_id, password) -> None:
                     user_id,
                 )
 
-                # Reject stale credentials or a deleted account.
                 if (
                     current_user is None
                     or current_user["password_hash"] != password_hash
@@ -715,8 +702,6 @@ def generate_signing_keypair(user_id, password) -> None:
                         "Password verification failed."
                     )
 
-                # CN must still match the account used to build
-                # the certificate.
                 if current_user["username"] != username:
                     raise RuntimeError(
                         "Account username changed during key generation."
@@ -751,8 +736,6 @@ def generate_signing_keypair(user_id, password) -> None:
                 )
 
         except sqlite3.IntegrityError as exc:
-            # Only the primary-key violation is treated as a
-            # duplicate user signing key.
             if (
                 getattr(exc, "sqlite_errorcode", None)
                 == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
@@ -761,5 +744,81 @@ def generate_signing_keypair(user_id, password) -> None:
                     "User already has a signing keypair."
                 ) from None
 
-            # Other database failures must remain visible.
             raise
+
+
+# ============================================================
+# Stage 5c: Public signing-key retrieval and signer lookup
+# ============================================================
+
+_SIGNING_FINGERPRINT_PATTERN = re.compile(
+    r"[0-9A-F]{4}( [0-9A-F]{4}){15}"
+)
+
+
+def get_signing_key(user_id) -> dict | None:
+    """Return public signing-key information, if available."""
+
+    _signing_key_context(user_id)
+
+    if user_id > (1 << 63) - 1:
+        raise ValueError("User does not exist.")
+
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                public_key_pem,
+                fingerprint,
+                certificate_der,
+                expires_at
+            FROM signing_keys
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "public_key_pem": row["public_key_pem"],
+        "fingerprint": row["fingerprint"],
+        "certificate_der": row["certificate_der"],
+        "expires_at": row["expires_at"],
+    }
+
+
+def find_signer_by_fingerprint(fingerprint) -> dict | None:
+    """Resolve a canonical signing fingerprint to a registered user."""
+
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 79
+        or _SIGNING_FINGERPRINT_PATTERN.fullmatch(
+            fingerprint
+        ) is None
+    ):
+        raise ValueError("Invalid signing fingerprint.")
+
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                sk.user_id,
+                u.username
+            FROM signing_keys AS sk
+            JOIN users AS u
+                ON u.id = sk.user_id
+            WHERE sk.fingerprint = ?
+            """,
+            (fingerprint,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"],
+    }
