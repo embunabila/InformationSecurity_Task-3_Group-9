@@ -609,6 +609,27 @@ def get_signature_record(file_id, owner_id):
     finally:
         connection.close()
 
+
+def get_signed_file_ids_for_owner(owner_id):
+    """Return the set of the owner's medical_files ids that are signed copies."""
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT ds.signed_file_id
+            FROM document_signatures AS ds
+            JOIN medical_files AS mf
+                ON ds.signed_file_id = mf.id
+            WHERE mf.owner_id = ?
+            """,
+            (owner_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    return {row["signed_file_id"] for row in rows}
+
 # =============================================
 # DATABASE INITIALIZATION
 # =============================================
