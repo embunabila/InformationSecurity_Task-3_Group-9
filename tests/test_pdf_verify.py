@@ -364,6 +364,20 @@ class TestPdfVerify(unittest.TestCase):
         with self.assertRaises(InvalidSignatureError):
             _validate_byte_range(pdf_bytes, byte_range)
 
+    def test_validate_byte_range_with_invalid_pdf_bytes(self):
+        invalid_pdf_inputs = [
+            None,
+            "prefix<30AA>suffix",
+            bytearray(b"prefix<30AA>suffix"),
+            123,
+        ]
+
+        byte_range = [0, 6, 12, 6]
+
+        for pdf_bytes in invalid_pdf_inputs:
+            with self.subTest(pdf_bytes=pdf_bytes):
+                with self.assertRaises(InvalidSignatureError):
+                    _validate_byte_range(pdf_bytes, byte_range)
     # ---------------------------------------------------------
     # Raw signature dictionary tests
     # ---------------------------------------------------------
@@ -585,6 +599,7 @@ class TestPdfVerify(unittest.TestCase):
             result["signed_revision_length"],
             len(modified_pdf),
         )
+        
 
 
 if __name__ == "__main__":
