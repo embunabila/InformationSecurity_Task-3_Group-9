@@ -14,6 +14,10 @@
       <a class="{% if request.path.startswith('/requests') %}active{% endif %}" href="/requests"><span>⇄</span> Access requests</a>
       <a class="{% if request.path.startswith('/shared') %}active{% endif %}" href="/shared"><span>⇩</span> Shared with me</a>
       <a class="{% if request.path == '/verify' %}active{% endif %}" href="/verify"><span>✓</span> Verify PDF</a>
+    <a href="/sign"
+   class="{% if request.path.startswith('/sign') %}active{% endif %}">
+    <span>✍</span> Sign Document
+</a>
     </nav>
 
     <div class="sidebar-bottom">

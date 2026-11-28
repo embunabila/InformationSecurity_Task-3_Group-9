@@ -1,0 +1,337 @@
+
+{% extends "app_base.html" %}
+
+{% block title %}Sign Document — Medimo{% endblock %}
+
+{% block content %}
+
+<header class="top">
+    <div>
+        <span class="eyebrow">DIGITAL SIGNATURE</span>
+        <h1>Sign document</h1>
+        <p class="muted">
+            Securely sign your health documents using your personal signing key.
+        </p>
+    </div>
+</header>
+
+<div class="sign-layout">
+
+    <!-- Introduction -->
+    <div class="card panel sign-intro">
+        <div class="profile-intro">
+            <span class="icon" aria-hidden="true">✍</span>
+            <div>
+                <h2>Document signing</h2>
+                <p class="muted">
+                    Create a digital signature to protect the authenticity
+                    and integrity of your health documents.
+                </p>
+            </div>
+        </div>
+
+        <div class="sign-info-grid">
+            <div>
+                <span class="eyebrow">ALGORITHM</span>
+                <strong>RSA-3072</strong>
+            </div>
+            <div>
+                <span class="eyebrow">DIGEST</span>
+                <strong>SHA-256</strong>
+            </div>
+            <div>
+                <span class="eyebrow">FORMAT</span>
+                <strong>PDF / CMS</strong>
+            </div>
+        </div>
+    </div>
+
+    <!-- Signing form -->
+    <div class="card panel sign-panel">
+
+        <div class="section-title" style="margin-top:0">
+            <span class="eyebrow">STEP 01</span>
+            <h2>Select your document</h2>
+            <p class="muted">
+                Choose a document from your health archive.
+            </p>
+        </div>
+
+        {% if documents %}
+
+        <form id="sign-form" class="stack">
+
+            <label for="document-select">Available documents</label>
+
+            <select
+                id="document-select"
+                name="file_id"
+                required
+            >
+                <option value="">Select a document</option>
+
+                {% for doc in documents %}
+                    <option
+                        value="{{ doc.id }}"
+                        data-category="{{ doc.category }}"
+                        data-created="{{ doc.created_at }}"
+                        {% if doc.signed %}disabled{% endif %}
+                    >
+                        {{ doc.category|title }} — {{ doc.created_at }}
+                        {% if doc.signed %}(Already signed){% endif %}
+                    </option>
+                {% endfor %}
+            </select>
+
+            <div id="document-preview" class="sign-document">
+                <div class="empty-icon">📄</div>
+                <h3>No document selected</h3>
+                <p class="muted">
+                    Select a document to see its details.
+                </p>
+            </div>
+
+            <div class="divider-line"></div>
+
+            <div class="section-title">
+                <span class="eyebrow">STEP 02</span>
+                <h2>Unlock your signing key</h2>
+                <p class="muted">
+                    Enter your signing key password to authorize the operation.
+                </p>
+            </div>
+
+            <label for="sign-password">Signing key password</label>
+
+            <input
+                type="password"
+                id="sign-password"
+                name="password"
+                autocomplete="current-password"
+                placeholder="Enter your signing key password"
+                required
+            >
+
+            <small>
+                Your private key remains encrypted and is never displayed.
+            </small>
+
+            <div class="notice">
+                <strong>Before signing</strong>
+                <p style="margin:6px 0 0">
+                    Make sure you have selected the correct document.
+                    Digital signatures are intended to protect document integrity.
+                </p>
+            </div>
+
+            <div id="sign-message" role="status" aria-live="polite"></div>
+
+            <button
+                type="submit"
+                class="button primary"
+                id="sign-button"
+            >
+                ✍ Sign document
+            </button>
+
+        </form>
+
+        {% else %}
+
+        <div class="sign-document empty-state">
+            <div class="empty-icon">📂</div>
+            <h3>No documents available</h3>
+            <p class="muted">
+                Upload a document to your health archive before signing it.
+            </p>
+            <a href="/archives" class="button primary">
+                Go to My Archives
+            </a>
+        </div>
+
+        {% endif %}
+
+    </div>
+
+</div>
+
+<style>
+.sign-layout {
+    display: grid;
+    grid-template-columns: 1fr 1.3fr;
+    gap: 18px;
+    align-items: start;
+}
+
+.sign-intro {
+    background: linear-gradient(145deg, #ffffff, #f4faff);
+}
+
+.sign-info-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+    margin-top: 20px;
+}
+
+.sign-info-grid div {
+    display: grid;
+    gap: 5px;
+    padding: 13px;
+    background: #f1f7fb;
+    border-radius: 11px;
+}
+
+.sign-info-grid strong {
+    color: var(--ink);
+    font-size: 14px;
+}
+
+.sign-panel {
+    min-width: 0;
+}
+
+.sign-document {
+    margin-top: 12px;
+    padding: 20px;
+    background: #f7fafc;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+}
+
+.sign-document .empty-icon {
+    margin-bottom: 12px;
+    font-size: 25px;
+}
+
+.sign-document h3 {
+    margin-bottom: 4px;
+}
+
+.sign-document p {
+    margin-bottom: 0;
+    font-size: 12px;
+}
+
+.sign-document .profile-intro {
+    margin-bottom: 14px;
+}
+
+.sign-document .eyebrow {
+    display: inline-block;
+    margin-top: 12px;
+}
+
+.empty-state {
+    text-align: center;
+    padding: 35px 20px;
+}
+
+.empty-state .button {
+    display: inline-block;
+    margin-top: 18px;
+    text-decoration: none;
+}
+
+.divider-line {
+    border-top: 1px solid var(--line);
+    margin: 24px 0;
+}
+
+#sign-message:not(:empty) {
+    padding: 12px;
+    border-radius: 10px;
+    background: #fff5e9;
+    color: #91612b;
+    font-size: 13px;
+}
+
+@media(max-width: 850px) {
+    .sign-layout {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+
+<script>
+(() => {
+    const select = document.getElementById("document-select");
+    const preview = document.getElementById("document-preview");
+    const form = document.getElementById("sign-form");
+    const password = document.getElementById("sign-password");
+    const message = document.getElementById("sign-message");
+
+    if (!select || !form || !preview) return;
+
+    select.addEventListener("change", () => {
+        const option = select.selectedOptions[0];
+
+        message.textContent = "";
+
+        if (!select.value || !option) {
+            preview.innerHTML = `
+                <div class="empty-icon">📄</div>
+                <h3>No document selected</h3>
+                <p class="muted">
+                    Select a document to see its details.
+                </p>
+            `;
+            return;
+        }
+
+        const category = option.dataset.category || "Document";
+        const created = option.dataset.created || "-";
+
+        const intro = document.createElement("div");
+        intro.className = "profile-intro";
+
+        const icon = document.createElement("span");
+        icon.className = "icon";
+        icon.textContent = "📄";
+
+        const details = document.createElement("div");
+
+        const heading = document.createElement("h3");
+        heading.textContent = "Selected document";
+
+        const subtitle = document.createElement("p");
+        subtitle.className = "muted";
+        subtitle.textContent = category;
+
+        details.append(heading, subtitle);
+        intro.append(icon, details);
+
+        const categoryInfo = document.createElement("p");
+        categoryInfo.textContent = `Category: ${category}`;
+
+        const dateInfo = document.createElement("p");
+        dateInfo.textContent = `Uploaded: ${created}`;
+
+        const status = document.createElement("span");
+        status.className = "eyebrow";
+        status.textContent = "READY FOR REVIEW";
+
+        preview.replaceChildren(
+            intro,
+            categoryInfo,
+            dateInfo,
+            status
+        );
+    });
+
+    form.addEventListener("submit", (event) => {
+        event.preventDefault();
+
+        if (!select.value || !password.value) {
+            message.textContent =
+                "Please select a document and enter your password.";
+            return;
+        }
+
+        message.textContent =
+            "Signing service is not connected yet.";
+    });
+})();
+</script>
+
+{% endblock %}
