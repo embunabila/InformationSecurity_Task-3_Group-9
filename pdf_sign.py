@@ -418,3 +418,4 @@ def embed_signature(prepared_pdf, byte_range, cms_der):
         raise RuntimeError("Embedding changed bytes outside /Contents.")
 
     return signed_pdf
+

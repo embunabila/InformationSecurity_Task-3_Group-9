@@ -16,9 +16,11 @@ from pdf_sign import (
     embed_signature,
 )
 from pdf_verify import (
+    _validate_signature_binding,
     extract_signatures,
     _validate_byte_range,
     _read_raw_signature_dictionary,
+    _extract_signature_field_references,
 )
 from share_errors import (
     InvalidPdfError,
@@ -26,7 +28,8 @@ from share_errors import (
     UnsupportedSignatureError,
 )
 
-
+_validate_signature_binding,
+_extract_signature_field_references,
 SIGNER = "Test Signer"
 
 SIGNING_TIME = datetime(
@@ -317,6 +320,48 @@ def replace_signature_dictionary_key(pdf_bytes, old_key, new_key):
     )
 
 
+def replace_byte_range_start(pdf_bytes, byte_range):
+    """Change the ByteRange start offset without changing PDF length."""
+    reader, signature_ref = get_signature_context(pdf_bytes)
+
+    offset = reader.xref[signature_ref.generation][signature_ref.idnum]
+    dictionary_end = pdf_bytes.find(b">>", offset)
+
+    byte_range_key = pdf_bytes.find(
+        b"/ByteRange",
+        offset,
+        dictionary_end,
+    )
+
+    assert byte_range_key >= 0
+
+    array_start = pdf_bytes.find(
+        b"[",
+        byte_range_key,
+        dictionary_end,
+    )
+
+    assert array_start >= 0
+
+    original_value = str(byte_range[1]).encode("ascii")
+    replacement_value = str(byte_range[1] + 1).encode("ascii")
+
+    assert len(original_value) == len(replacement_value)
+
+    value_position = pdf_bytes.find(
+        original_value,
+        array_start,
+        dictionary_end,
+    )
+
+    assert value_position >= 0
+
+    return (
+        pdf_bytes[:value_position]
+        + replacement_value
+        + pdf_bytes[value_position + len(original_value):]
+    )
+
 def test_read_raw_signature_dictionary_rejects_duplicate_contents():
     pdf_bytes, _ = make_signed_pdf()
 
@@ -385,3 +430,148 @@ def test_read_raw_signature_dictionary_rejects_non_hex_contents():
             modified_reader,
             modified_ref,
         )
+
+def test_extract_signature_field_reference_preserves_original_reference():
+    pdf_bytes, _ = make_signed_pdf()
+
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+
+    root = reader.trailer["/Root"].get_object()
+    acro_form = root["/AcroForm"].get_object()
+
+    fields = acro_form.get("/Fields", [])
+
+    field = fields[0].get_object()
+    expected_ref = field.raw_get("/V")
+
+    result = _extract_signature_field_references(fields)
+
+    assert len(result) == 1
+    assert result[0]["field_name"] == "Medimo-Signature"
+    assert result[0]["signature_ref"] == expected_ref
+
+def test_validate_signature_binding_with_valid_signed_pdf():
+    pdf_bytes, byte_range = make_signed_pdf()
+
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+
+    root = reader.trailer["/Root"].get_object()
+    acro_form = root["/AcroForm"].get_object()
+    fields = acro_form.get("/Fields", [])
+
+    field_info = _extract_signature_field_references(fields)[0]
+
+    result = _validate_signature_binding(
+        pdf_bytes,
+        reader,
+        field_info,
+    )
+
+    assert result["byte_range"] == byte_range
+    assert result["contents_start"] == byte_range[1]
+    assert result["contents_end"] == byte_range[2]
+    assert result["signed_revision_length"] == len(pdf_bytes)    
+
+
+def test_validate_signature_binding_rejects_modified_byte_range():
+    pdf_bytes, byte_range = make_signed_pdf()
+
+    modified_pdf = replace_byte_range_start(
+        pdf_bytes,
+        byte_range,
+    )
+
+    reader, signature_ref = get_signature_context(modified_pdf)
+
+    field_info = {
+        "field_name": "Medimo-Signature",
+        "field_ref": reader.trailer["/Root"]
+        .get_object()["/AcroForm"]
+        .get_object()["/Fields"][0],
+        "signature_ref": signature_ref,
+    }
+
+    with pytest.raises(InvalidSignatureError):
+        _validate_signature_binding(
+            modified_pdf,
+            reader,
+            field_info,
+        )
+
+
+
+def test_validate_signature_binding_rejects_wrong_field_reference():
+    pdf_bytes, _ = make_signed_pdf()
+
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+
+    root = reader.trailer["/Root"].get_object()
+    acro_form = root["/AcroForm"].get_object()
+    fields = acro_form["/Fields"]
+
+    field = fields[0].get_object()
+    signature_ref = field.raw_get("/V")
+
+    # Use the document root as an incorrect field reference.
+    wrong_field_ref = reader.trailer.raw_get("/Root")
+
+    field_info = {
+        "field_name": "Medimo-Signature",
+        "field_ref": wrong_field_ref,
+        "signature_ref": signature_ref,
+    }
+
+    with pytest.raises(InvalidSignatureError):
+        _validate_signature_binding(
+            pdf_bytes,
+            reader,
+            field_info,
+        )
+
+
+def test_validate_signature_binding_with_incremental_update():
+    pdf_bytes, _ = make_signed_pdf()
+
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+
+    writer = PdfWriter(reader, incremental=True)
+    writer.add_metadata({
+        "/Subject": "Modified after signing",
+    })
+
+    output = io.BytesIO()
+    writer.write(output)
+
+    modified_pdf = output.getvalue()
+
+    assert modified_pdf.startswith(pdf_bytes)
+    assert len(modified_pdf) > len(pdf_bytes)
+
+    # Ambil field reference dari PDF sebelum incremental update.
+    original_reader = PdfReader(
+        io.BytesIO(pdf_bytes),
+        strict=True,
+    )
+    original_root = original_reader.trailer["/Root"].get_object()
+    original_acro_form = original_root["/AcroForm"].get_object()
+    original_fields = original_acro_form["/Fields"]
+
+    field_info = _extract_signature_field_references(
+        original_fields
+    )[0]
+
+    # Validasi binding terhadap PDF yang sudah mendapat incremental update.
+    modified_reader = PdfReader(
+        io.BytesIO(modified_pdf),
+        strict=True,
+    )
+
+    result = _validate_signature_binding(
+        modified_pdf,
+        modified_reader,
+        field_info,
+    )
+
+    assert result["signed_revision_length"] == len(pdf_bytes)
+    assert result["signed_revision_length"] < len(modified_pdf)
+
