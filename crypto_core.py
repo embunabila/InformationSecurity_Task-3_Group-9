@@ -117,10 +117,10 @@ def _encode_context(context):
         raise ValueError("owner_id harus integer positif, bukan boolean.")
 
     if not isinstance(kind, str) or kind not in (
-        "profile", "file", "private_key", "share"
+        "profile", "file", "private_key", "share", "signing_key"
     ):
         raise ValueError(
-            "kind harus profile, file, private_key, atau share."
+            "kind harus profile, file, private_key, share, atau signing_key."
         )
 
     if not isinstance(item_id, str):
@@ -136,6 +136,12 @@ def _encode_context(context):
         if item_id != "private_key":
             raise ValueError(
                 "item_id untuk private_key harus berupa string private_key."
+            )
+
+    elif kind == "signing_key":
+        if item_id != "signing_key":
+            raise ValueError(
+                "item_id untuk signing_key harus berupa string signing_key."
             )
 
     else:
