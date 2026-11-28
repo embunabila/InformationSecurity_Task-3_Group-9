@@ -45,6 +45,7 @@ from db import (
     save_health_profile,
     delete_medical_file_record,
     get_medical_files_for_owner,
+    get_signed_file_ids_for_owner,
 )
 
 from file_payload import pack_file_payload, unpack_file_payload
@@ -668,6 +669,7 @@ def list_archives():
             return redirect(url_for("login"))
 
         records = get_medical_files_for_owner(user_id)
+        signed_ids = get_signed_file_ids_for_owner(user_id)
     except sqlite3.Error:
         return "Daftar arsip tidak dapat diakses.", 503
 
@@ -676,6 +678,7 @@ def list_archives():
             "id": record["id"],
             "category": record["category"],
             "created_at": record["created_at"],
+            "signed": record["id"] in signed_ids,
         }
         for record in records
     ]

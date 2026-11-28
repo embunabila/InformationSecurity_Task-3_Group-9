@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 DB_PATH = Path(__file__).resolve().parent / "medimo.db"
@@ -212,6 +213,80 @@ def init_db():
                 FOREIGN KEY (request_id)
                     REFERENCES share_requests(id)
                     ON DELETE SET NULL,
+
+                FOREIGN KEY (actor_id)
+                    REFERENCES users(id)
+                    ON DELETE SET NULL
+            );
+
+
+            -- =========================================
+            -- TASK 3: SIGNING KEYS
+            -- =========================================
+
+            CREATE TABLE IF NOT EXISTS signing_keys (
+                user_id INTEGER PRIMARY KEY,
+                public_key_pem TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                certificate_der BLOB NOT NULL,
+                private_key_salt BLOB NOT NULL,
+                encrypted_private_key BLOB NOT NULL,
+                failed_unlock_count INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            );
+
+
+            -- =========================================
+            -- TASK 3: DOCUMENT SIGNATURES
+            -- =========================================
+
+            CREATE TABLE IF NOT EXISTS document_signatures (
+                id TEXT PRIMARY KEY,
+                signed_file_id TEXT NOT NULL UNIQUE,
+                source_file_id TEXT,
+                signer_id INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                document_digest TEXT NOT NULL,
+                signed_at TEXT NOT NULL,
+
+                FOREIGN KEY (signed_file_id)
+                    REFERENCES medical_files(id)
+                    ON DELETE CASCADE,
+
+                FOREIGN KEY (source_file_id)
+                    REFERENCES medical_files(id)
+                    ON DELETE SET NULL,
+
+                FOREIGN KEY (signer_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            );
+
+
+            -- =========================================
+            -- TASK 3: SIGNATURE AUDIT LOG
+            -- =========================================
+
+            CREATE TABLE IF NOT EXISTS signature_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id INTEGER,
+                file_id TEXT,
+                action TEXT NOT NULL
+                    CHECK (
+                        action IN (
+                            'key_generated',
+                            'signed',
+                            'verified',
+                            'verify_failed'
+                        )
+                    ),
+                created_at TEXT NOT NULL,
 
                 FOREIGN KEY (actor_id)
                     REFERENCES users(id)
@@ -472,7 +547,88 @@ def delete_medical_file_record(file_id, owner_id):
             return cursor.rowcount == 1
     finally:
         connection.close()
+# =============================================
+# TASK 3: SIGNATURE DATABASE FUNCTIONS
+# =============================================
 
+def record_signature_event(actor_id, file_id, action):
+    allowed_actions = {
+        "key_generated",
+        "signed",
+        "verified",
+        "verify_failed",
+    }
+
+    if action not in allowed_actions:
+        raise ValueError("Signature audit action tidak valid.")
+
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    connection = get_connection()
+
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO signature_audit_log (
+                    actor_id,
+                    file_id,
+                    action,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (actor_id, file_id, action, created_at),
+            )
+    finally:
+        connection.close()
+
+
+def get_signature_record(file_id, owner_id):
+    connection = get_connection()
+
+    try:
+        return connection.execute(
+            """
+            SELECT
+                ds.id,
+                ds.signed_file_id,
+                ds.source_file_id,
+                ds.signer_id,
+                ds.fingerprint,
+                ds.document_digest,
+                ds.signed_at
+            FROM document_signatures AS ds
+            JOIN medical_files AS mf
+                ON ds.signed_file_id = mf.id
+            WHERE ds.signed_file_id = ?
+                AND mf.owner_id = ?
+            """,
+            (file_id, owner_id),
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def get_signed_file_ids_for_owner(owner_id):
+    """Return the set of the owner's medical_files ids that are signed copies."""
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT ds.signed_file_id
+            FROM document_signatures AS ds
+            JOIN medical_files AS mf
+                ON ds.signed_file_id = mf.id
+            WHERE mf.owner_id = ?
+            """,
+            (owner_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    return {row["signed_file_id"] for row in rows}
 
 # =============================================
 # DATABASE INITIALIZATION
