@@ -1,11 +1,38 @@
 import base64
+import sqlite3
+import tempfile
 import unittest
 
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import ECC, RSA
 from Crypto.Signature import pkcs1_15
+
+from werkzeug.security import generate_password_hash
+
+import db
+import signing_keys
+
+from certificate import (
+    build_self_signed_certificate,
+    parse_certificate,
+)
+
+from crypto_core import (
+    decrypt_blob,
+    InvalidEnvelopeError,
+)
+
+from der import (
+    decode_value,
+    parse_der,
+)
+
+from share_errors import KeyUnlockError
 
 from signing_keys import (
     _emsa_pkcs1_v1_5_encode,
@@ -14,8 +41,14 @@ from signing_keys import (
     _generate_signing_kek_salt,
     _signing_key_context,
     signing_public_key_fingerprint,
+    generate_signing_keypair,
     rsa_sign,
     rsa_verify,
+)
+
+from user_keys import (
+    generate_user_keypair,
+    public_key_fingerprint,
 )
 
 
@@ -188,8 +221,7 @@ class TestEMSAPKCS1v15(unittest.TestCase):
             with self.subTest(length=length):
                 with self.assertRaises(ValueError):
                     _emsa_pkcs1_v1_5_encode_digest(
-                        bytes(length),
-                        256,
+                        bytes(length), 256
                     )
 
     def test_invalid_message_types(self):
@@ -211,15 +243,8 @@ class TestEMSAPKCS1v15(unittest.TestCase):
 
     def test_invalid_em_lengths(self):
         for k in (
-            0,
-            -1,
-            True,
-            False,
-            256.0,
-            "256",
-            None,
-            513,
-            10**100,
+            0, -1, True, False, 256.0,
+            "256", None, 513, 10**100,
         ):
             with self.subTest(k=k):
                 with self.assertRaises(ValueError):
@@ -228,13 +253,7 @@ class TestEMSAPKCS1v15(unittest.TestCase):
                     )
 
     def test_invalid_include_null(self):
-        for value in (
-            None,
-            0,
-            1,
-            "True",
-            b"true",
-        ):
+        for value in (None, 0, 1, "True", b"true"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     _emsa_pkcs1_v1_5_encode_digest(
@@ -260,11 +279,7 @@ class TestEMSAPKCS1v15(unittest.TestCase):
                 )
 
                 self.assertEqual(len(em), 384)
-
-                self.assertEqual(
-                    em[:2],
-                    b"\x00\x01",
-                )
+                self.assertEqual(em[:2], b"\x00\x01")
 
                 self.assertEqual(
                     em[2:separator],
@@ -281,10 +296,7 @@ class TestEMSAPKCS1v15(unittest.TestCase):
                     prefix,
                 )
 
-                self.assertEqual(
-                    em[-32:],
-                    digest,
-                )
+                self.assertEqual(em[-32:], digest)
 
     def test_empty_message(self):
         expected = (
@@ -346,9 +358,7 @@ class TestRSASign(unittest.TestCase):
             self.message,
         )
 
-        self.assertIsInstance(
-            signature, bytes
-        )
+        self.assertIsInstance(signature, bytes)
 
         self.assertEqual(
             self.private_key.size_in_bits(),
@@ -362,12 +372,7 @@ class TestRSASign(unittest.TestCase):
 
     def test_signature_length(self):
         self.assertEqual(
-            len(
-                rsa_sign(
-                    self.private_key,
-                    self.message,
-                )
-            ),
+            len(rsa_sign(self.private_key, self.message)),
             384,
         )
 
@@ -380,11 +385,7 @@ class TestRSASign(unittest.TestCase):
         s = int.from_bytes(signature, "big")
 
         self.assertGreaterEqual(s, 0)
-
-        self.assertLess(
-            s,
-            self.private_key.n,
-        )
+        self.assertLess(s, self.private_key.n)
 
         expected_em = (
             b"\x00\x01"
@@ -407,27 +408,19 @@ class TestRSASign(unittest.TestCase):
 
     def test_deterministic_signature(self):
         first = rsa_sign(
-            self.private_key,
-            self.message,
+            self.private_key, self.message
         )
 
         second = rsa_sign(
-            self.private_key,
-            self.message,
+            self.private_key, self.message
         )
 
         self.assertEqual(first, second)
 
     def test_different_messages(self):
         self.assertNotEqual(
-            rsa_sign(
-                self.private_key,
-                b"message A",
-            ),
-            rsa_sign(
-                self.private_key,
-                b"message B",
-            ),
+            rsa_sign(self.private_key, b"message A"),
+            rsa_sign(self.private_key, b"message B"),
         )
 
     def test_different_private_keys(self):
@@ -437,20 +430,13 @@ class TestRSASign(unittest.TestCase):
         )
 
         self.assertNotEqual(
-            rsa_sign(
-                self.private_key,
-                self.message,
-            ),
-            rsa_sign(
-                self.other_key,
-                self.message,
-            ),
+            rsa_sign(self.private_key, self.message),
+            rsa_sign(self.other_key, self.message),
         )
 
     def test_empty_message(self):
         signature = rsa_sign(
-            self.private_key,
-            b"",
+            self.private_key, b""
         )
 
         self.assertEqual(
@@ -460,10 +446,7 @@ class TestRSASign(unittest.TestCase):
 
     def test_invalid_message_types(self):
         for value in (
-            None,
-            "abc",
-            123,
-            True,
+            None, "abc", 123, True,
             bytearray(b"abc"),
             memoryview(b"abc"),
         ):
@@ -471,10 +454,7 @@ class TestRSASign(unittest.TestCase):
                 value_type=type(value).__name__
             ):
                 with self.assertRaises(ValueError):
-                    rsa_sign(
-                        self.private_key,
-                        value,
-                    )
+                    rsa_sign(self.private_key, value)
 
     def test_public_key_rejected(self):
         with self.assertRaises(ValueError):
@@ -485,21 +465,14 @@ class TestRSASign(unittest.TestCase):
 
     def test_invalid_key_inputs(self):
         for key in (
-            None,
-            123,
-            True,
-            "private key",
-            b"not a key",
-            object(),
+            None, 123, True,
+            "private key", b"not a key", object(),
         ):
             with self.subTest(
                 key_type=type(key).__name__
             ):
                 with self.assertRaises(ValueError):
-                    rsa_sign(
-                        key,
-                        self.message,
-                    )
+                    rsa_sign(key, self.message)
 
     def test_wrong_key_sizes_rejected(self):
         for bits in (2048, 4096):
@@ -507,15 +480,11 @@ class TestRSASign(unittest.TestCase):
                 key = RSA.generate(bits)
 
                 with self.assertRaises(ValueError):
-                    rsa_sign(
-                        key,
-                        self.message,
-                    )
+                    rsa_sign(key, self.message)
 
     def test_reference_verification(self):
         signature = rsa_sign(
-            self.private_key,
-            self.message,
+            self.private_key, self.message
         )
 
         pkcs1_15.new(
@@ -534,13 +503,8 @@ class TestRSASign(unittest.TestCase):
         ):
             with self.subTest(message=message):
                 self.assertEqual(
-                    rsa_sign(
-                        self.private_key,
-                        message,
-                    ),
-                    self.reference_signature(
-                        message
-                    ),
+                    rsa_sign(self.private_key, message),
+                    self.reference_signature(message),
                 )
 
     def test_leading_zero_signature_serialization(self):
@@ -550,34 +514,22 @@ class TestRSASign(unittest.TestCase):
                 + counter.to_bytes(4, "big")
             )
 
-            expected = self.reference_signature(
-                message
-            )
+            expected = self.reference_signature(message)
 
             if expected[0] == 0:
                 break
-
         else:
             self.fail(
                 "No leading-zero signature found within search limit"
             )
 
         actual = rsa_sign(
-            self.private_key,
-            message,
+            self.private_key, message
         )
 
         self.assertEqual(len(actual), 384)
-
-        self.assertEqual(
-            actual[:1],
-            b"\x00",
-        )
-
-        self.assertEqual(
-            actual,
-            expected,
-        )
+        self.assertEqual(actual[:1], b"\x00")
+        self.assertEqual(actual, expected)
 
     def test_inconsistent_rsa_private_key_rejected(self):
         key = self.private_key
@@ -594,10 +546,7 @@ class TestRSASign(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            rsa_sign(
-                inconsistent,
-                self.message,
-            )
+            rsa_sign(inconsistent, self.message)
 
     def test_message_representative_out_of_range(self):
         k = self.private_key.size_in_bytes()
@@ -637,19 +586,12 @@ class TestRSAVerify(unittest.TestCase):
                 bits,
                 e=3 if bits == 2048 else 65537,
             )
-            for bits in (
-                2048, 2049, 3072, 4096
-            )
+            for bits in (2048, 2049, 3072, 4096)
         }
 
         cls.key = cls.keys[2048]
-
-        cls.pem = (
-            cls.key.public_key().export_key()
-        )
-
+        cls.pem = cls.key.public_key().export_key()
         cls.k = cls.key.size_in_bytes()
-
         cls.message = b"abc"
 
         cls.signature = pkcs1_15.new(
@@ -665,29 +607,17 @@ class TestRSAVerify(unittest.TestCase):
         )
 
     def raw_sign_em(self, em):
-        """Test-only private operation: recover exactly the supplied EM."""
+        """Test-only private operation for independently built EM."""
 
-        self.assertEqual(
-            len(em),
-            self.k,
-        )
+        self.assertEqual(len(em), self.k)
 
         m = int.from_bytes(em, "big")
+        self.assertLess(m, self.key.n)
 
-        self.assertLess(
-            m,
-            self.key.n,
-        )
-
-        s = pow(
-            m,
-            self.key.d,
-            self.key.n,
-        )
+        s = pow(m, self.key.d, self.key.n)
 
         signature = s.to_bytes(
-            self.k,
-            "big",
+            self.k, "big"
         )
 
         self.assertEqual(
@@ -695,10 +625,7 @@ class TestRSAVerify(unittest.TestCase):
                 s,
                 self.key.e,
                 self.key.n,
-            ).to_bytes(
-                self.k,
-                "big",
-            ),
+            ).to_bytes(self.k, "big"),
             em,
         )
 
@@ -709,9 +636,7 @@ class TestRSAVerify(unittest.TestCase):
 
         return (
             b"\x00\x01"
-            + b"\xff" * (
-                self.k - len(t) - 3
-            )
+            + b"\xff" * (self.k - len(t) - 3)
             + b"\x00"
             + t
         )
@@ -737,7 +662,6 @@ class TestRSAVerify(unittest.TestCase):
 
             if length < 128:
                 size = bytes([length])
-
             else:
                 value = length.to_bytes(
                     (length.bit_length() + 7) // 8,
@@ -749,11 +673,7 @@ class TestRSAVerify(unittest.TestCase):
                     + value
                 )
 
-            return (
-                bytes([tag])
-                + size
-                + content
-            )
+            return bytes([tag]) + size + content
 
         def integer(value):
             bits = (
@@ -789,10 +709,7 @@ class TestRSAVerify(unittest.TestCase):
             rsa_verify(
                 key.public_key().export_key(),
                 self.message,
-                rsa_sign(
-                    key,
-                    self.message,
-                ),
+                rsa_sign(key, self.message),
             ),
             True,
         )
@@ -809,8 +726,7 @@ class TestRSAVerify(unittest.TestCase):
                         self.pem,
                         message,
                         self.reference_signature(
-                            self.key,
-                            message,
+                            self.key, message
                         ),
                     ),
                     True,
@@ -825,8 +741,7 @@ class TestRSAVerify(unittest.TestCase):
                 )
 
                 signature = self.reference_signature(
-                    key,
-                    self.message,
+                    key, self.message
                 )
 
                 self.assertEqual(
@@ -849,9 +764,7 @@ class TestRSAVerify(unittest.TestCase):
                 self.pem,
                 self.message,
                 self.raw_sign_em(
-                    self.independent_em(
-                        NULL_PREFIX
-                    )
+                    self.independent_em(NULL_PREFIX)
                 ),
             ),
             True,
@@ -863,9 +776,7 @@ class TestRSAVerify(unittest.TestCase):
                 self.pem,
                 self.message,
                 self.raw_sign_em(
-                    self.independent_em(
-                        ABSENT_PREFIX
-                    )
+                    self.independent_em(ABSENT_PREFIX)
                 ),
             ),
             True,
@@ -877,8 +788,7 @@ class TestRSAVerify(unittest.TestCase):
                 self.pem,
                 b"",
                 self.reference_signature(
-                    self.key,
-                    b"",
+                    self.key, b""
                 ),
             ),
             True,
@@ -887,9 +797,7 @@ class TestRSAVerify(unittest.TestCase):
     def test_modified_message(self):
         self.assertIs(
             rsa_verify(
-                self.pem,
-                b"abd",
-                self.signature,
+                self.pem, b"abd", self.signature
             ),
             False,
         )
@@ -897,16 +805,12 @@ class TestRSAVerify(unittest.TestCase):
     def test_signature_one_bit_modified(self):
         tampered = (
             self.signature[:-1]
-            + bytes([
-                self.signature[-1] ^ 1
-            ])
+            + bytes([self.signature[-1] ^ 1])
         )
 
         self.assertIs(
             rsa_verify(
-                self.pem,
-                self.message,
-                tampered,
+                self.pem, self.message, tampered
             ),
             False,
         )
@@ -930,9 +834,7 @@ class TestRSAVerify(unittest.TestCase):
             b"\x00" + self.signature,
             self.signature + b"\x00",
         ):
-            with self.subTest(
-                length=len(signature)
-            ):
+            with self.subTest(length=len(signature)):
                 self.assertIs(
                     rsa_verify(
                         self.pem,
@@ -948,17 +850,12 @@ class TestRSAVerify(unittest.TestCase):
             self.key.n + 1,
             (1 << (8 * self.k)) - 1,
         ):
-            with self.subTest(
-                representative=s
-            ):
+            with self.subTest(representative=s):
                 self.assertIs(
                     rsa_verify(
                         self.pem,
                         self.message,
-                        s.to_bytes(
-                            self.k,
-                            "big",
-                        ),
+                        s.to_bytes(self.k, "big"),
                     ),
                     False,
                 )
@@ -977,7 +874,11 @@ class TestRSAVerify(unittest.TestCase):
         for pem in (
             b"",
             b"not a PEM",
-            b"-----BEGIN PUBLIC KEY-----\n!\n-----END PUBLIC KEY-----",
+            (
+                b"-----BEGIN PUBLIC KEY-----\n"
+                b"!\n"
+                b"-----END PUBLIC KEY-----"
+            ),
             self.pem[:40],
             "-----BEGIN PUBLIC KEY-----\n\u2603",
         ):
@@ -1014,9 +915,7 @@ class TestRSAVerify(unittest.TestCase):
                 format="DER"
             ),
         ):
-            with self.subTest(
-                pem_format=pem[:20]
-            ):
+            with self.subTest(pem_format=pem[:20]):
                 self.assertIs(
                     rsa_verify(
                         pem,
@@ -1057,8 +956,7 @@ class TestRSAVerify(unittest.TestCase):
                 )
 
                 signature = self.reference_signature(
-                    key,
-                    self.message,
+                    key, self.message
                 )
 
                 self.assertEqual(
@@ -1077,18 +975,13 @@ class TestRSAVerify(unittest.TestCase):
 
     def test_invalid_public_exponents(self):
         for e in (
-            0,
-            1,
-            2,
-            4,
-            -3,
+            0, 1, 2, 4, -3,
             self.key.n,
             self.key.n + 2,
         ):
             with self.subTest(exponent=e):
                 pem = self.public_pem(
-                    self.key.n,
-                    e,
+                    self.key.n, e
                 )
 
                 self.assertIs(
@@ -1109,10 +1002,7 @@ class TestRSAVerify(unittest.TestCase):
             with self.subTest(modulus=n):
                 self.assertIs(
                     rsa_verify(
-                        self.public_pem(
-                            n,
-                            65537,
-                        ),
+                        self.public_pem(n, 65537),
                         self.message,
                         self.signature,
                     ),
@@ -1120,9 +1010,7 @@ class TestRSAVerify(unittest.TestCase):
                 )
 
     def test_inconsistent_public_components(self):
-        n = 3 * (
-            (1 << 2046) + 1
-        )
+        n = 3 * ((1 << 2046) + 1)
 
         self.assertEqual(
             n.bit_length(),
@@ -1140,9 +1028,7 @@ class TestRSAVerify(unittest.TestCase):
 
     def test_invalid_input_types(self):
         for value in (
-            None,
-            1,
-            True,
+            None, 1, True,
             bytearray(b"abc"),
             memoryview(b"abc"),
             object(),
@@ -1203,13 +1089,11 @@ class TestRSAVerify(unittest.TestCase):
             )
 
             signature = self.reference_signature(
-                self.key,
-                message,
+                self.key, message
             )
 
             if signature[0] == 0:
                 break
-
         else:
             self.fail(
                 "No leading-zero signature found within search limit"
@@ -1258,9 +1142,7 @@ class TestRSAVerify(unittest.TestCase):
             b"\x00\x01"
             + b"\xff" * 7
             + b"\x00"
-            + b"\xaa" * (
-                self.k - 10 - len(t)
-            )
+            + b"\xaa" * (self.k - 10 - len(t))
             + t
         )
 
@@ -1268,13 +1150,9 @@ class TestRSAVerify(unittest.TestCase):
 
     def test_malformed_em_incorrect_separator(self):
         em = self.independent_em()
-
         separator = self.k - 52
 
-        self.assertEqual(
-            em[separator],
-            0,
-        )
+        self.assertEqual(em[separator], 0)
 
         self.assert_bad_em(
             em[:separator]
@@ -1389,9 +1267,7 @@ class TestRSAVerify(unittest.TestCase):
                     compare_spy.call_args_list[0].args,
                     (
                         em,
-                        self.independent_em(
-                            NULL_PREFIX
-                        ),
+                        self.independent_em(NULL_PREFIX),
                     ),
                 )
 
@@ -1399,15 +1275,13 @@ class TestRSAVerify(unittest.TestCase):
                     compare_spy.call_args_list[1].args,
                     (
                         em,
-                        self.independent_em(
-                            ABSENT_PREFIX
-                        ),
+                        self.independent_em(ABSENT_PREFIX),
                     ),
                 )
 
 
 # ============================================================
-# Stage 5a: Signing-key management helper tests
+# Stage 5a: Existing signing-key helper tests
 # ============================================================
 
 
@@ -1418,10 +1292,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
         cls.keys = {
             bits: RSA.generate(bits)
             for bits in (
-                2048,
-                2049,
-                3072,
-                4096,
+                2048, 2049, 3072, 4096
             )
         }
 
@@ -1436,15 +1307,10 @@ class TestSigningKeyHelpers(unittest.TestCase):
         )
 
         cls.password = "Medimo-密码"
-
         cls.salt = bytes(range(16))
 
     def test_fingerprint_supported_sizes(self):
-        for bits in (
-            2048,
-            3072,
-            4096,
-        ):
+        for bits in (2048, 3072, 4096):
             with self.subTest(bits=bits):
                 key = self.keys[bits].public_key()
 
@@ -1457,10 +1323,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
                     key.export_key()
                 )
 
-                self.assertEqual(
-                    len(result),
-                    79,
-                )
+                self.assertEqual(len(result), 79)
 
     def test_fingerprint_non_byte_aligned(self):
         key = self.keys[2049].public_key()
@@ -1489,10 +1352,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
             self.pem
         )
 
-        self.assertEqual(
-            len(result),
-            79,
-        )
+        self.assertEqual(len(result), 79)
 
         self.assertRegex(
             result,
@@ -1530,7 +1390,6 @@ class TestSigningKeyHelpers(unittest.TestCase):
             )
         )
 
-        # Independent SPKI fixture with absent parameters.
         def tlv(tag, content):
             size = len(content)
 
@@ -1592,8 +1451,6 @@ class TestSigningKeyHelpers(unittest.TestCase):
                 )
 
     def test_fingerprint_task2_compatibility(self):
-        from user_keys import public_key_fingerprint
-
         self.assertEqual(
             signing_public_key_fingerprint(
                 self.pem
@@ -1661,10 +1518,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
                 input_type=type(value).__name__,
             ):
                 with self.assertRaises(ValueError):
-                    signing_public_key_fingerprint(
-                        value
-                    )
-
+                    signing_public_key_fingerprint(value)
 
     def test_fingerprint_unsupported_sizes(self):
         small = RSA.generate(
@@ -1676,24 +1530,15 @@ class TestSigningKeyHelpers(unittest.TestCase):
             65537,
         )
 
-        for pem in (
-            small,
-            oversized,
-        ):
+        for pem in (small, oversized):
             with self.assertRaises(ValueError):
-                signing_public_key_fingerprint(
-                    pem
-                )
+                signing_public_key_fingerprint(pem)
 
     def test_fingerprint_invalid_exponents(self):
         n = self.key.n
 
         for e in (
-            0,
-            1,
-            2,
-            4,
-            -3,
+            0, 1, 2, 4, -3,
             n,
             n + 2,
             self.keys[3072].p,
@@ -1701,10 +1546,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
             with self.subTest(e=e):
                 with self.assertRaises(ValueError):
                     signing_public_key_fingerprint(
-                        TestRSAVerify.public_pem(
-                            n,
-                            e,
-                        )
+                        TestRSAVerify.public_pem(n, e)
                     )
 
     def test_fingerprint_invalid_moduli(self):
@@ -1717,8 +1559,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     signing_public_key_fingerprint(
                         TestRSAVerify.public_pem(
-                            n,
-                            65537,
+                            n, 65537
                         )
                     )
 
@@ -1732,15 +1573,8 @@ class TestSigningKeyHelpers(unittest.TestCase):
         )
 
         for salt in salts:
-            self.assertIsInstance(
-                salt,
-                bytes,
-            )
-
-            self.assertEqual(
-                len(salt),
-                16,
-            )
+            self.assertIsInstance(salt, bytes)
+            self.assertEqual(len(salt), 16)
 
         self.assertEqual(
             len(set(salts)),
@@ -1748,11 +1582,6 @@ class TestSigningKeyHelpers(unittest.TestCase):
         )
 
     def test_kek_deterministic_known_answer(self):
-        # Independent known-answer fixture:
-        # password = "Medimo-密码"
-        # salt = 00 01 02 ... 0F
-        # N = 2**17, r = 8, p = 1, dkLen = 32
-
         expected = bytes.fromhex(
             "57262cc43b4c2f63d801e9e7d4de00f6"
             "b635aaaf7b9f5bf9a79f48e1fa07a070"
@@ -1768,37 +1597,26 @@ class TestSigningKeyHelpers(unittest.TestCase):
             self.salt,
         )
 
-        self.assertEqual(
-            first,
-            expected,
-        )
-
-        self.assertEqual(
-            second,
-            expected,
-        )
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
 
     def test_kek_different_password(self):
         self.assertNotEqual(
             _derive_signing_kek(
-                self.password,
-                self.salt,
+                self.password, self.salt
             ),
             _derive_signing_kek(
-                self.password + "!",
-                self.salt,
+                self.password + "!", self.salt
             ),
         )
 
     def test_kek_different_salt(self):
         self.assertNotEqual(
             _derive_signing_kek(
-                self.password,
-                self.salt,
+                self.password, self.salt
             ),
             _derive_signing_kek(
-                self.password,
-                b"\xff" * 16,
+                self.password, b"\xff" * 16
             ),
         )
 
@@ -1808,15 +1626,8 @@ class TestSigningKeyHelpers(unittest.TestCase):
             self.salt,
         )
 
-        self.assertIsInstance(
-            result,
-            bytes,
-        )
-
-        self.assertEqual(
-            len(result),
-            32,
-        )
+        self.assertIsInstance(result, bytes)
+        self.assertEqual(len(result), 32)
 
     def test_kek_invalid_passwords(self):
         for password in (
@@ -1868,10 +1679,7 @@ class TestSigningKeyHelpers(unittest.TestCase):
 
         actual = _signing_key_context(7)
 
-        self.assertEqual(
-            actual,
-            expected,
-        )
+        self.assertEqual(actual, expected)
 
         self.assertEqual(
             _encode_context(actual),
@@ -1893,6 +1701,678 @@ class TestSigningKeyHelpers(unittest.TestCase):
         )
 
         for user_id in (
+            None, True, False,
+            0, -1, "7", 7.0,
+        ):
+            with self.subTest(user_id=user_id):
+                with self.assertRaises(ValueError):
+                    _signing_key_context(user_id)
+
+
+# ============================================================
+# Stage 5b: Signing-key generation tests
+# ============================================================
+
+
+class TestGenerateSigningKeypair(unittest.TestCase):
+
+    USER_ID = 7
+    USERNAME = "signing_test_user"
+    PASSWORD = "Medimo-Test-密码"
+
+    @classmethod
+    def setUpClass(cls):
+        # All accounts are dummy test accounts.
+        # Reuse the real login password hash to reduce setup time.
+        cls.password_hash = generate_password_hash(
+            cls.PASSWORD,
+            method="scrypt:131072:8:1",
+        )
+
+        cls.changed_password_hash = generate_password_hash(
+            cls.PASSWORD + "-changed",
+            method="scrypt:131072:8:1",
+        )
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+
+        self.addCleanup(directory.cleanup)
+
+        self.db_path = (
+            Path(directory.name)
+            / "test_signing_keys.db"
+        )
+
+        db_patcher = patch.object(
+            db,
+            "DB_PATH",
+            self.db_path,
+        )
+
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+
+        # Use the real application schema.
+        db.init_db()
+
+        self.execute(
+            """
+            INSERT INTO users (
+                id,
+                username,
+                password_hash
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                self.USER_ID,
+                self.USERNAME,
+                self.password_hash,
+            ),
+        )
+
+    def execute(self, sql, parameters=()):
+        """Execute SQL in the temporary database only."""
+
+        with closing(db.get_connection()) as connection:
+            with connection:
+                connection.execute(
+                    sql,
+                    parameters,
+                )
+
+    def read_signing_row(self):
+        with closing(db.get_connection()) as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM signing_keys
+                WHERE user_id = ?
+                """,
+                (self.USER_ID,),
+            ).fetchone()
+
+    def read_encryption_row(self):
+        with closing(db.get_connection()) as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM user_keys
+                WHERE user_id = ?
+                """,
+                (self.USER_ID,),
+            ).fetchone()
+
+    def assert_no_signing_key(self):
+        self.assertIsNone(
+            self.read_signing_row()
+        )
+
+        with closing(db.get_connection()) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM signing_keys"
+            ).fetchone()[0]
+
+        self.assertEqual(count, 0)
+
+    def generate(self):
+        result = generate_signing_keypair(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.assertIsNone(result)
+
+        row = self.read_signing_row()
+        self.assertIsNotNone(row)
+
+        return row
+
+    def recover_private_der(self, row):
+        # Explicit independent context fixture.
+        context = {
+            "owner_id": self.USER_ID,
+            "kind": "signing_key",
+            "item_id": "signing_key",
+        }
+
+        kek = _derive_signing_kek(
+            self.PASSWORD,
+            row["private_key_salt"],
+        )
+
+        return decrypt_blob(
+            row["encrypted_private_key"],
+            kek,
+            "AES",
+            context,
+        )
+
+    # ========================================================
+    # Successful generation and storage
+    # ========================================================
+
+    def test_successful_generation_and_initial_storage(self):
+        row = self.generate()
+
+        self.assertEqual(
+            row["user_id"],
+            self.USER_ID,
+        )
+
+        self.assertIsInstance(
+            row["public_key_pem"],
+            str,
+        )
+
+        self.assertTrue(
+            row["public_key_pem"].startswith(
+                "-----BEGIN PUBLIC KEY-----"
+            )
+        )
+
+        public_key = RSA.import_key(
+            row["public_key_pem"]
+        )
+
+        self.assertFalse(public_key.has_private())
+
+        self.assertEqual(
+            public_key.size_in_bits(),
+            3072,
+        )
+
+        self.assertEqual(
+            public_key.size_in_bytes(),
+            384,
+        )
+
+        # Independently derive the expected fingerprint.
+        expected_hex = SHA256.new(
+            public_key.export_key(format="DER")
+        ).hexdigest().upper()
+
+        expected_fingerprint = " ".join(
+            expected_hex[i:i + 4]
+            for i in range(0, 64, 4)
+        )
+
+        self.assertEqual(
+            row["fingerprint"],
+            expected_fingerprint,
+        )
+
+        self.assertEqual(
+            len(row["fingerprint"]),
+            79,
+        )
+
+        self.assertIsInstance(
+            row["certificate_der"],
+            bytes,
+        )
+
+        self.assertEqual(
+            parse_der(row["certificate_der"]).raw,
+            row["certificate_der"],
+        )
+
+        self.assertIsInstance(
+            row["private_key_salt"],
+            bytes,
+        )
+
+        self.assertEqual(
+            len(row["private_key_salt"]),
+            16,
+        )
+
+        self.assertIsInstance(
+            row["encrypted_private_key"],
+            bytes,
+        )
+
+        self.assertTrue(
+            row["encrypted_private_key"].startswith(
+                b"MDMO\x01\x01"
+            )
+        )
+
+        self.assertEqual(
+            row["failed_unlock_count"],
+            0,
+        )
+
+        self.assertIsNone(
+            row["locked_until"]
+        )
+
+        self.assertIsNone(
+            self.read_encryption_row()
+        )
+
+        expected_columns = {
+            "user_id",
+            "public_key_pem",
+            "fingerprint",
+            "certificate_der",
+            "private_key_salt",
+            "encrypted_private_key",
+            "failed_unlock_count",
+            "locked_until",
+            "expires_at",
+            "created_at",
+        }
+
+        self.assertEqual(
+            set(row.keys()),
+            expected_columns,
+        )
+
+        with closing(db.get_connection()) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM signing_keys"
+            ).fetchone()[0]
+
+            audit_count = connection.execute(
+                "SELECT COUNT(*) FROM signature_audit_log"
+            ).fetchone()[0]
+
+        self.assertEqual(count, 1)
+
+        # Audit responsibility belongs to the caller.
+        self.assertEqual(audit_count, 0)
+
+    def test_certificate_consistency_and_self_signature(self):
+        row = self.generate()
+
+        parsed = parse_certificate(
+            row["certificate_der"]
+        )
+
+        stored_key = RSA.import_key(
+            row["public_key_pem"]
+        )
+
+        certificate_key = RSA.import_key(
+            parsed["public_key_pem"]
+        )
+
+        self.assertEqual(
+            (certificate_key.n, certificate_key.e),
+            (stored_key.n, stored_key.e),
+        )
+
+        self.assertEqual(
+            certificate_key.export_key(format="DER"),
+            stored_key.export_key(format="DER"),
+        )
+
+        self.assertEqual(
+            parsed["subject_cn"],
+            self.USERNAME,
+        )
+
+        self.assertEqual(
+            signing_public_key_fingerprint(
+                parsed["public_key_pem"]
+            ),
+            row["fingerprint"],
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                parsed["public_key_pem"],
+                parsed["tbs_der"],
+                parsed["signature"],
+            )
+        )
+
+        # Independent signature verification.
+        pkcs1_15.new(
+            certificate_key
+        ).verify(
+            SHA256.new(parsed["tbs_der"]),
+            parsed["signature"],
+        )
+
+        created_at = datetime.fromisoformat(
+            row["created_at"]
+        )
+
+        expires_at = datetime.fromisoformat(
+            row["expires_at"]
+        )
+
+        self.assertEqual(
+            created_at,
+            parsed["not_before"],
+        )
+
+        self.assertEqual(
+            expires_at,
+            parsed["not_after"],
+        )
+
+        self.assertEqual(
+            expires_at - created_at,
+            timedelta(days=730),
+        )
+
+        for value in (created_at, expires_at):
+            self.assertIsNotNone(value.tzinfo)
+
+            self.assertEqual(
+                value.utcoffset(),
+                timedelta(0),
+            )
+
+            self.assertEqual(
+                value.microsecond,
+                0,
+            )
+
+        self.assertTrue(
+            row["created_at"].endswith("+00:00")
+        )
+
+        self.assertTrue(
+            row["expires_at"].endswith("+00:00")
+        )
+
+    def test_recover_encrypted_pkcs8_private_key(self):
+        row = self.generate()
+
+        private_der = self.recover_private_der(row)
+
+        self.assertIsInstance(
+            private_der,
+            bytes,
+        )
+
+        # PKCS#8 PrivateKeyInfo has version,
+        # AlgorithmIdentifier and privateKey OCTET STRING.
+        fields = decode_value(
+            parse_der(private_der),
+            0x30,
+        )
+
+        self.assertEqual(
+            [field.tag for field in fields],
+            [0x02, 0x30, 0x04],
+        )
+
+        self.assertEqual(
+            decode_value(fields[0], 0x02),
+            0,
+        )
+
+        recovered = RSA.import_key(private_der)
+
+        stored = RSA.import_key(
+            row["public_key_pem"]
+        )
+
+        self.assertTrue(
+            recovered.has_private()
+        )
+
+        self.assertEqual(
+            recovered.size_in_bits(),
+            3072,
+        )
+
+        self.assertEqual(
+            (recovered.n, recovered.e),
+            (stored.n, stored.e),
+        )
+
+        self.assertEqual(
+            recovered.public_key().export_key(format="DER"),
+            stored.export_key(format="DER"),
+        )
+
+        self.assertNotEqual(
+            private_der,
+            row["encrypted_private_key"],
+        )
+
+        self.assertNotIn(
+            private_der,
+            row["encrypted_private_key"],
+        )
+
+        # The recovered key can actually sign.
+        message = b"Recovered signing key test"
+
+        signature = rsa_sign(
+            recovered,
+            message,
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                row["public_key_pem"],
+                message,
+                signature,
+            )
+        )
+
+    # ========================================================
+    # Encryption and key separation
+    # ========================================================
+
+    def test_wrong_kek_cannot_decrypt_private_key(self):
+        row = self.generate()
+
+        wrong_kek = _derive_signing_kek(
+            self.PASSWORD + "-wrong",
+            row["private_key_salt"],
+        )
+
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_blob(
+                row["encrypted_private_key"],
+                wrong_kek,
+                "AES",
+                _signing_key_context(self.USER_ID),
+            )
+
+        self.assertEqual(
+            dict(self.read_signing_row()),
+            dict(row),
+        )
+
+    def test_wrong_context_cannot_decrypt_private_key(self):
+        row = self.generate()
+
+        kek = _derive_signing_kek(
+            self.PASSWORD,
+            row["private_key_salt"],
+        )
+
+        wrong_contexts = (
+            {
+                "owner_id": self.USER_ID,
+                "kind": "private_key",
+                "item_id": "private_key",
+            },
+            {
+                "owner_id": self.USER_ID + 1,
+                "kind": "signing_key",
+                "item_id": "signing_key",
+            },
+        )
+
+        for context in wrong_contexts:
+            with self.subTest(context=context):
+                with self.assertRaises(
+                    InvalidEnvelopeError
+                ):
+                    decrypt_blob(
+                        row["encrypted_private_key"],
+                        kek,
+                        "AES",
+                        context,
+                    )
+
+    def test_task2_key_and_lockout_state_remain_separate(self):
+        # Generate a genuine Task 2 encryption keypair.
+        generate_user_keypair(
+            self.USER_ID,
+            self.PASSWORD,
+        )
+
+        self.execute(
+            """
+            UPDATE user_keys
+            SET failed_unlock_count = ?,
+                locked_until = ?
+            WHERE user_id = ?
+            """,
+            (
+                5,
+                "2099-01-01T00:00:00+00:00",
+                self.USER_ID,
+            ),
+        )
+
+        legacy_before = dict(
+            self.read_encryption_row()
+        )
+
+        signing = self.generate()
+
+        legacy_after = dict(
+            self.read_encryption_row()
+        )
+
+        # All legacy fields must remain unchanged.
+        self.assertEqual(
+            legacy_before,
+            legacy_after,
+        )
+
+        encryption_key = RSA.import_key(
+            legacy_before["public_key_pem"]
+        )
+
+        signing_key = RSA.import_key(
+            signing["public_key_pem"]
+        )
+
+        self.assertEqual(
+            encryption_key.size_in_bits(),
+            3072,
+        )
+
+        self.assertEqual(
+            signing_key.size_in_bits(),
+            3072,
+        )
+
+        self.assertNotEqual(
+            encryption_key.n,
+            signing_key.n,
+        )
+
+        self.assertNotEqual(
+            legacy_before["fingerprint"],
+            signing["fingerprint"],
+        )
+
+        self.assertNotEqual(
+            legacy_before["private_key_salt"],
+            signing["private_key_salt"],
+        )
+
+        self.assertNotEqual(
+            legacy_before["encrypted_private_key"],
+            signing["encrypted_private_key"],
+        )
+
+        legacy_kek = _derive_signing_kek(
+            self.PASSWORD,
+            legacy_before["private_key_salt"],
+        )
+
+        signing_kek = _derive_signing_kek(
+            self.PASSWORD,
+            signing["private_key_salt"],
+        )
+
+        self.assertNotEqual(
+            legacy_kek,
+            signing_kek,
+        )
+
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_blob(
+                signing["encrypted_private_key"],
+                legacy_kek,
+                "AES",
+                _signing_key_context(self.USER_ID),
+            )
+
+        self.assertEqual(
+            legacy_after["failed_unlock_count"],
+            5,
+        )
+
+        self.assertEqual(
+            legacy_after["locked_until"],
+            "2099-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual(
+            signing["failed_unlock_count"],
+            0,
+        )
+
+        self.assertIsNone(
+            signing["locked_until"]
+        )
+
+    # ========================================================
+    # Account validation
+    # ========================================================
+
+    def test_wrong_and_invalid_passwords_rejected(self):
+        passwords = (
+            "wrong-password",
+            "",
+            None,
+            123,
+            True,
+            b"password",
+            "\ud800",
+        )
+
+        # Expensive RSA generation must not occur.
+        with patch(
+            "signing_keys.RSA.generate",
+            side_effect=AssertionError(
+                "RSA generation must not be reached"
+            ),
+        ) as generation:
+
+            for password in passwords:
+                with self.subTest(
+                    password_type=type(password).__name__
+                ):
+                    with self.assertRaises(KeyUnlockError):
+                        generate_signing_keypair(
+                            self.USER_ID,
+                            password,
+                        )
+
+            generation.assert_not_called()
+
+        self.assert_no_signing_key()
+
+    def test_invalid_and_nonexistent_user_ids(self):
+        values = (
             None,
             True,
             False,
@@ -1900,12 +2380,589 @@ class TestSigningKeyHelpers(unittest.TestCase):
             -1,
             "7",
             7.0,
+            b"7",
+            999999,
+            1 << 63,
+        )
+
+        with patch(
+            "signing_keys.RSA.generate",
+            side_effect=AssertionError(
+                "RSA generation must not be reached"
+            ),
+        ) as generation:
+
+            for user_id in values:
+                with self.subTest(user_id=user_id):
+                    with self.assertRaises(ValueError):
+                        generate_signing_keypair(
+                            user_id,
+                            self.PASSWORD,
+                        )
+
+            generation.assert_not_called()
+
+        self.assert_no_signing_key()
+
+    def test_duplicate_signing_key_generation_rejected(self):
+        original = dict(
+            self.generate()
+        )
+
+        with patch(
+            "signing_keys.RSA.generate",
+            side_effect=AssertionError(
+                "Existing key must not be regenerated"
+            ),
+        ) as generation:
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "already has a signing keypair",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+            generation.assert_not_called()
+
+        self.assertEqual(
+            dict(self.read_signing_row()),
+            original,
+        )
+
+    # ========================================================
+    # Concurrent account and key changes
+    # ========================================================
+
+    def test_concurrent_duplicate_created_during_generation(self):
+        # Prepare a genuine competing signing-key record.
+        competitor = dict(
+            self.generate()
+        )
+
+        self.execute(
+            """
+            DELETE FROM signing_keys
+            WHERE user_id = ?
+            """,
+            (self.USER_ID,),
+        )
+
+        def concurrent_insert_then_build(
+            private_key,
+            username,
+            not_before,
+            not_after,
         ):
-            with self.subTest(user_id=user_id):
-                with self.assertRaises(ValueError):
-                    _signing_key_context(
-                        user_id
-                    )
+            # A separate connection must be able to write while
+            # the original request is generating key material.
+            self.execute(
+                """
+                INSERT INTO signing_keys (
+                    user_id,
+                    public_key_pem,
+                    fingerprint,
+                    certificate_der,
+                    private_key_salt,
+                    encrypted_private_key,
+                    failed_unlock_count,
+                    locked_until,
+                    expires_at,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    competitor["user_id"],
+                    competitor["public_key_pem"],
+                    competitor["fingerprint"],
+                    competitor["certificate_der"],
+                    competitor["private_key_salt"],
+                    competitor["encrypted_private_key"],
+                    competitor["failed_unlock_count"],
+                    competitor["locked_until"],
+                    competitor["expires_at"],
+                    competitor["created_at"],
+                ),
+            )
+
+            return build_self_signed_certificate(
+                private_key,
+                username,
+                not_before,
+                not_after,
+            )
+
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=concurrent_insert_then_build,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "already has a signing keypair",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        # The first successful record must never be overwritten.
+        self.assertEqual(
+            dict(self.read_signing_row()),
+            competitor,
+        )
+
+    def test_password_hash_changes_during_generation(self):
+        def change_password_then_build(
+            private_key,
+            username,
+            not_before,
+            not_after,
+        ):
+            self.execute(
+                """
+                UPDATE users
+                SET password_hash = ?
+                WHERE id = ?
+                """,
+                (
+                    self.changed_password_hash,
+                    self.USER_ID,
+                ),
+            )
+
+            return build_self_signed_certificate(
+                private_key,
+                username,
+                not_before,
+                not_after,
+            )
+
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=change_password_then_build,
+        ):
+            with self.assertRaises(KeyUnlockError):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+        with closing(db.get_connection()) as connection:
+            user = connection.execute(
+                """
+                SELECT password_hash
+                FROM users
+                WHERE id = ?
+                """,
+                (self.USER_ID,),
+            ).fetchone()
+
+        self.assertEqual(
+            user["password_hash"],
+            self.changed_password_hash,
+        )
+
+    def test_user_deleted_during_generation(self):
+        def delete_user_then_build(
+            private_key,
+            username,
+            not_before,
+            not_after,
+        ):
+            self.execute(
+                """
+                DELETE FROM users
+                WHERE id = ?
+                """,
+                (self.USER_ID,),
+            )
+
+            return build_self_signed_certificate(
+                private_key,
+                username,
+                not_before,
+                not_after,
+            )
+
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=delete_user_then_build,
+        ):
+            with self.assertRaises(KeyUnlockError):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+        with closing(db.get_connection()) as connection:
+            user = connection.execute(
+                """
+                SELECT id
+                FROM users
+                WHERE id = ?
+                """,
+                (self.USER_ID,),
+            ).fetchone()
+
+        self.assertIsNone(user)
+
+    def test_username_changes_during_generation(self):
+        def change_username_then_build(
+            private_key,
+            username,
+            not_before,
+            not_after,
+        ):
+            self.execute(
+                """
+                UPDATE users
+                SET username = ?
+                WHERE id = ?
+                """,
+                (
+                    "renamed_signing_user",
+                    self.USER_ID,
+                ),
+            )
+
+            return build_self_signed_certificate(
+                private_key,
+                username,
+                not_before,
+                not_after,
+            )
+
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=change_username_then_build,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "username changed",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+    # ========================================================
+    # Failure injection and certificate consistency
+    # ========================================================
+
+    def test_certificate_generation_failure_no_partial_key(self):
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=RuntimeError(
+                "Injected certificate generation failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Injected certificate",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+    def test_encryption_failure_no_partial_key(self):
+        with patch(
+            "signing_keys.encrypt_blob",
+            side_effect=RuntimeError(
+                "Injected encryption failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Injected encryption failure",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+    def test_database_insert_failure_rolls_back(self):
+        # SQLite RAISE(FAIL) does not necessarily undo earlier
+        # changes made by the statement. Transaction rollback
+        # must remove the inserted row.
+        self.execute(
+            """
+            CREATE TRIGGER test_fail_signing_insert
+            AFTER INSERT ON signing_keys
+            BEGIN
+                SELECT RAISE(
+                    FAIL,
+                    'Injected signing insert failure'
+                );
+            END
+            """
+        )
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "Injected signing insert failure",
+        ):
+            generate_signing_keypair(
+                self.USER_ID,
+                self.PASSWORD,
+            )
+
+        self.assert_no_signing_key()
+
+        # Remove the failure injection and verify that the DB
+        # remains usable after the failed transaction.
+        self.execute(
+            "DROP TRIGGER test_fail_signing_insert"
+        )
+
+        row = self.generate()
+
+        self.assertEqual(
+            row["user_id"],
+            self.USER_ID,
+        )
+
+    def test_certificate_public_key_mismatch_rejected(self):
+        other_private_key = RSA.generate(3072)
+
+        def build_with_other_key(
+            private_key,
+            username,
+            not_before,
+            not_after,
+        ):
+            # Produce a genuine self-signed certificate, but
+            # with a different RSA keypair.
+            self.assertNotEqual(
+                private_key.n,
+                other_private_key.n,
+            )
+
+            return build_self_signed_certificate(
+                other_private_key,
+                username,
+                not_before,
+                not_after,
+            )
+
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=build_with_other_key,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "certificate public key mismatch",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+    def test_invalid_certificate_self_signature_rejected(self):
+        def build_tampered_certificate(
+            private_key,
+            username,
+            not_before,
+            not_after,
+        ):
+            certificate = build_self_signed_certificate(
+                private_key,
+                username,
+                not_before,
+                not_after,
+            )
+
+            # The final byte belongs to the signature BIT STRING.
+            # Preserve structure but alter the signature.
+            modified = (
+                certificate[:-1]
+                + bytes([certificate[-1] ^ 1])
+            )
+
+            parsed = parse_certificate(modified)
+
+            self.assertFalse(
+                rsa_verify(
+                    parsed["public_key_pem"],
+                    parsed["tbs_der"],
+                    parsed["signature"],
+                )
+            )
+
+            return modified
+
+        with patch(
+            "signing_keys.build_self_signed_certificate",
+            side_effect=build_tampered_certificate,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "self-signature is invalid",
+            ):
+                generate_signing_keypair(
+                    self.USER_ID,
+                    self.PASSWORD,
+                )
+
+        self.assert_no_signing_key()
+
+    def test_primary_key_constraint_failure_is_duplicate_error(self):
+        # Inject a primary-key collision after the application's
+        # duplicate check but before the original INSERT succeeds.
+        # Use a different fingerprint to isolate the PK constraint.
+        self.execute(
+            """
+            CREATE TRIGGER test_signing_pk_collision
+            BEFORE INSERT ON signing_keys
+            WHEN NEW.failed_unlock_count = 0
+            BEGIN
+                INSERT INTO signing_keys (
+                    user_id,
+                    public_key_pem,
+                    fingerprint,
+                    certificate_der,
+                    private_key_salt,
+                    encrypted_private_key,
+                    failed_unlock_count,
+                    locked_until,
+                    expires_at,
+                    created_at
+                )
+                VALUES (
+                    NEW.user_id,
+                    NEW.public_key_pem,
+                    'TEST-COLLISION-FINGERPRINT',
+                    NEW.certificate_der,
+                    NEW.private_key_salt,
+                    NEW.encrypted_private_key,
+                    1,
+                    NULL,
+                    NEW.expires_at,
+                    NEW.created_at
+                );
+            END
+            """
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "already has a signing keypair",
+        ):
+            generate_signing_keypair(
+                self.USER_ID,
+                self.PASSWORD,
+            )
+
+        # Neither the injected record nor the original record
+        # may survive the failed transaction.
+        self.assert_no_signing_key()
+
+    # ========================================================
+    # Time boundaries and immediate signing
+    # ========================================================
+
+    def test_leap_year_timestamp_and_immediate_signing(self):
+        generation_time = datetime(
+            2028, 2, 29,
+            23, 59, 59, 987654,
+            tzinfo=timezone.utc,
+        )
+
+        expected_start = datetime(
+            2028, 2, 29,
+            23, 59, 59,
+            tzinfo=timezone.utc,
+        )
+
+        expected_end = datetime(
+            2030, 2, 28,
+            23, 59, 59,
+            tzinfo=timezone.utc,
+        )
+
+        with patch(
+            "signing_keys._signing_utc_now",
+            return_value=generation_time,
+        ) as clock:
+
+            row = self.generate()
+
+        clock.assert_called_once_with()
+
+        parsed = parse_certificate(
+            row["certificate_der"]
+        )
+
+        self.assertEqual(
+            parsed["not_before"],
+            expected_start,
+        )
+
+        self.assertEqual(
+            parsed["not_after"],
+            expected_end,
+        )
+
+        self.assertEqual(
+            parsed["not_after"] - parsed["not_before"],
+            timedelta(days=730),
+        )
+
+        self.assertEqual(
+            row["created_at"],
+            "2028-02-29T23:59:59+00:00",
+        )
+
+        self.assertEqual(
+            row["expires_at"],
+            "2030-02-28T23:59:59+00:00",
+        )
+
+        # Signing immediately in the same second must not
+        # fall before the certificate validity interval.
+        immediate_signing_time = generation_time.replace(
+            microsecond=0
+        )
+
+        self.assertTrue(
+            parsed["not_before"]
+            <= immediate_signing_time
+            <= parsed["not_after"]
+        )
+
+        recovered = RSA.import_key(
+            self.recover_private_der(row)
+        )
+
+        message = b"Immediate signing after key generation"
+
+        signature = rsa_sign(
+            recovered,
+            message,
+        )
+
+        self.assertTrue(
+            rsa_verify(
+                row["public_key_pem"],
+                message,
+                signature,
+            )
+        )
 
 
 if __name__ == "__main__":
