@@ -1,0 +1,246 @@
+
+import io
+from datetime import datetime, timezone
+
+import pytest
+from pypdf import PdfWriter
+from pypdf.generic import (
+    ArrayObject,
+    DictionaryObject,
+    NameObject,
+    TextStringObject,
+)
+
+from pdf_sign import (
+    prepare_pdf_for_signing,
+    embed_signature,
+)
+from pdf_verify import (
+    extract_signatures,
+    _validate_byte_range,
+)
+from share_errors import (
+    InvalidPdfError,
+    InvalidSignatureError,
+    UnsupportedSignatureError,
+)
+
+
+SIGNER = "Test Signer"
+
+SIGNING_TIME = datetime(
+    2026, 11, 27, 9, 30, 0,
+    tzinfo=timezone.utc,
+)
+
+# Dummy DER data for extraction testing only.
+# This is NOT a valid CMS digital signature.
+DUMMY_CMS = b"\x30\x00"
+
+
+def make_pdf():
+    """Create a simple valid PDF without signatures."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+
+    output = io.BytesIO()
+    writer.write(output)
+
+    return output.getvalue()
+
+
+def make_pdf_with_empty_signature_field():
+    """Create a valid PDF containing an empty signature field."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+
+    signature_field = DictionaryObject({
+        NameObject("/FT"): NameObject("/Sig"),
+        NameObject("/T"): TextStringObject("TestSignature"),
+    })
+
+    acro_form = DictionaryObject({
+        NameObject("/Fields"): ArrayObject([signature_field]),
+    })
+
+    writer.root_object[NameObject("/AcroForm")] = acro_form
+
+    output = io.BytesIO()
+    writer.write(output)
+
+    return output.getvalue()
+
+
+def make_signed_pdf():
+    """Create a PDF containing a dummy embedded signature."""
+    original_pdf = make_pdf()
+
+    prepared_pdf, byte_range = prepare_pdf_for_signing(
+        original_pdf,
+        SIGNER,
+        SIGNING_TIME,
+    )
+
+    signed_pdf = embed_signature(
+        prepared_pdf,
+        byte_range,
+        DUMMY_CMS,
+    )
+
+    return signed_pdf, byte_range
+
+
+def make_pdf_with_contents(contents_hex):
+    """Create a simple byte sequence with a Contents-like gap."""
+    prefix = b"prefix"
+    suffix = b"suffix"
+
+    pdf_bytes = prefix + b"<" + contents_hex + b">" + suffix
+
+    a = len(prefix)
+    b = a + len(contents_hex) + 2
+    c = len(suffix)
+
+    return pdf_bytes, [0, a, b, c]
+
+
+# --------------------------------------------------
+# Signature extraction tests
+# --------------------------------------------------
+
+def test_extract_signatures_without_signature():
+    pdf_bytes = make_pdf()
+
+    result = extract_signatures(pdf_bytes)
+
+    assert result == []
+
+
+def test_extract_signatures_with_empty_signature_field():
+    pdf_bytes = make_pdf_with_empty_signature_field()
+
+    result = extract_signatures(pdf_bytes)
+
+    assert result == []
+
+
+def test_extract_signatures_with_invalid_pdf():
+    with pytest.raises(InvalidPdfError):
+        extract_signatures(b"not a valid PDF")
+
+
+def test_extract_signatures_with_empty_bytes():
+    with pytest.raises(InvalidPdfError):
+        extract_signatures(b"")
+
+
+def test_extract_signatures_with_filled_signature():
+    pdf_bytes, expected_byte_range = make_signed_pdf()
+
+    result = extract_signatures(pdf_bytes)
+
+    assert len(result) == 1
+
+    signature = result[0]
+
+    assert signature["field_name"] == "Medimo-Signature"
+    assert signature["sub_filter"] == "/adbe.pkcs7.detached"
+    assert signature["byte_range"] == expected_byte_range
+
+
+# --------------------------------------------------
+# ByteRange validation tests
+# --------------------------------------------------
+
+def test_validate_byte_range_with_valid_contents():
+    pdf_bytes, byte_range = make_pdf_with_contents(b"30AA")
+
+    a, b, c, contents_hex = _validate_byte_range(
+        pdf_bytes,
+        byte_range,
+    )
+
+    assert pdf_bytes[a:b] == b"<30AA>"
+    assert c == 6
+    assert contents_hex == b"30AA"
+
+
+def test_validate_byte_range_with_signed_pdf():
+    pdf_bytes, byte_range = make_signed_pdf()
+
+    a, b, c, contents_hex = _validate_byte_range(
+        pdf_bytes,
+        byte_range,
+    )
+
+    assert pdf_bytes[a:a + 1] == b"<"
+    assert pdf_bytes[b - 1:b] == b">"
+    assert len(contents_hex) > 0
+    assert c == len(pdf_bytes) - b
+
+
+@pytest.mark.parametrize(
+    "byte_range",
+    [
+        None,
+        [],
+        [0, 1, 2],
+        [0, 1, 2, 3, 4],
+        [False, 1, 2, 3],
+        [0, True, 2, 3],
+        [0, 1, False, 3],
+        [0, 1, 2, True],
+        [0, -1, 2, 3],
+        [0, 1, -2, 3],
+        [0, 1, 2, -3],
+        [1, 1, 2, 3],
+        [0, 2, 2, 3],
+        [0, 1, 100, 100],
+    ],
+)
+def test_validate_byte_range_with_invalid_values(byte_range):
+    pdf_bytes = b"prefix<30AA>suffix"
+
+    with pytest.raises(InvalidSignatureError):
+        _validate_byte_range(pdf_bytes, byte_range)
+
+
+def test_validate_byte_range_with_invalid_opening_bracket():
+    pdf_bytes, byte_range = make_pdf_with_contents(b"30AA")
+
+    a = byte_range[1]
+    modified_pdf = pdf_bytes[:a] + b"[" + pdf_bytes[a + 1:]
+
+    with pytest.raises(InvalidSignatureError):
+        _validate_byte_range(modified_pdf, byte_range)
+
+
+def test_validate_byte_range_with_invalid_closing_bracket():
+    pdf_bytes, byte_range = make_pdf_with_contents(b"30AA")
+
+    b = byte_range[2]
+    modified_pdf = pdf_bytes[:b - 1] + b"]" + pdf_bytes[b:]
+
+    with pytest.raises(InvalidSignatureError):
+        _validate_byte_range(modified_pdf, byte_range)
+
+
+def test_validate_byte_range_with_whitespace_in_contents():
+    pdf_bytes, byte_range = make_pdf_with_contents(b"30 AA")
+
+    with pytest.raises(UnsupportedSignatureError):
+        _validate_byte_range(pdf_bytes, byte_range)
+
+
+def test_validate_byte_range_with_odd_hex_length():
+    pdf_bytes, byte_range = make_pdf_with_contents(b"30A")
+
+    with pytest.raises(UnsupportedSignatureError):
+        _validate_byte_range(pdf_bytes, byte_range)
+
+
+def test_validate_byte_range_with_non_hex_contents():
+    pdf_bytes, byte_range = make_pdf_with_contents(b"30G0")
+
+    with pytest.raises(InvalidSignatureError):
+        _validate_byte_range(pdf_bytes, byte_range)
