@@ -7,15 +7,21 @@
 
 <header class="top">
     <div>
-        <span class="eyebrow">DATA SHARING</span>
+        <span class="eyebrow">KEY MANAGEMENT</span>
         <h1>My keys</h1>
         <p class="muted">
-            Manage your personal encryption keys.
+            Manage your encryption and signing keys.
         </p>
     </div>
 </header>
 
 <div class="card panel profile-panel">
+
+    <h2 id="encryption-key-heading">Encryption key</h2>
+
+    <p class="muted">
+        Used to securely request and access shared health records.
+    </p>
 
     {% if error %}
     <div class="alert error" role="alert">
@@ -204,6 +210,341 @@
     {% endif %}
 
 </div>
+
+
+<!-- =======================================================
+     Task 3: Independent signing key management
+     ======================================================= -->
+
+<section
+    class="card panel profile-panel"
+    id="signing-key-section"
+    aria-labelledby="signing-key-heading"
+    style="margin-top: 20px; min-width: 0;"
+>
+    <h2 id="signing-key-heading">Signing key</h2>
+
+    <p class="muted">
+        Used exclusively to digitally sign PDF documents.
+        This keypair is separate from your encryption key.
+    </p>
+
+    {% if signing_key %}
+
+    <div class="profile-intro">
+        <span class="icon" aria-hidden="true">✓</span>
+
+        <div>
+            <h2>Your signing key is ready</h2>
+
+            <p class="muted">
+                RSA-3072 · X.509 certificate · Private key encrypted
+            </p>
+        </div>
+    </div>
+
+    <h3>Signing public key fingerprint</h3>
+
+    <p class="muted">
+        This SHA-256 fingerprint identifies your signing public key.
+        It is different from your encryption key fingerprint.
+    </p>
+
+    <label for="signing-fingerprint" class="muted">
+        SHA-256 fingerprint
+    </label>
+
+    <textarea
+        id="signing-fingerprint"
+        readonly
+        rows="3"
+        spellcheck="false"
+        aria-label="Signing public key fingerprint"
+        style="
+            display: block;
+            width: 100%;
+            margin-top: 8px;
+            padding: 14px;
+            border: 1px solid #d8e5ef;
+            border-radius: 10px;
+            background: #fbfdff;
+            color: var(--ink);
+            font-family: monospace;
+            font-size: 14px;
+            line-height: 1.8;
+            resize: vertical;
+        "
+    >{{ signing_key.fingerprint }}</textarea>
+
+    <div style="
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+    ">
+        <button
+            class="button primary"
+            type="button"
+            id="copy-signing-fingerprint"
+        >
+            Copy fingerprint
+        </button>
+
+        <span
+            id="signing-copy-status"
+            class="muted"
+            role="status"
+            aria-live="polite"
+        ></span>
+    </div>
+
+    <div style="margin-top: 24px;">
+        <h3>Certificate information</h3>
+
+        <dl style="
+            display: grid;
+            grid-template-columns: repeat(
+                auto-fit, minmax(min(100%, 190px), 1fr)
+            );
+            gap: 16px;
+            margin: 16px 0;
+            overflow-wrap: anywhere;
+        ">
+            <div>
+                <dt class="muted">Certificate subject (CN)</dt>
+
+                <dd
+                    id="signing-certificate-subject"
+                    style="margin: 4px 0 0;"
+                >{{ signing_key.subject_cn }}</dd>
+            </div>
+
+            <div>
+                <dt class="muted">Certificate type</dt>
+                <dd style="margin: 4px 0 0;">
+                    Self-signed X.509
+                </dd>
+            </div>
+
+            <div>
+                <dt class="muted">Valid from</dt>
+
+                <dd
+                    id="signing-valid-from"
+                    style="margin: 4px 0 0;"
+                >{{ signing_key.valid_from }}</dd>
+            </div>
+
+            <div>
+                <dt class="muted">Expires on</dt>
+
+                <dd
+                    id="signing-expires-at"
+                    style="margin: 4px 0 0;"
+                >{{ signing_key.expires_at }}</dd>
+            </div>
+
+            <div>
+                <dt class="muted">Validity status</dt>
+
+                <dd
+                    id="signing-validity-status"
+                    style="margin: 4px 0 0; font-weight: 700;"
+                >{{ signing_key.validity_status }}</dd>
+            </div>
+        </dl>
+
+        {% if signing_key.is_currently_valid %}
+        <div class="alert success" role="status">
+            <p>
+                Your certificate is within its validity period.
+                This does not establish external certificate trust.
+            </p>
+        </div>
+
+        {% elif signing_key.validity_status == "Expired" %}
+        <div class="alert error" role="alert">
+            <p>
+                Kunci tanda tangan Anda sudah kedaluwarsa.
+                Medimo belum mendukung pembuatan kunci baru.
+            </p>
+        </div>
+
+        {% else %}
+        <div class="alert error" role="alert">
+            <p>Your certificate is not yet valid.</p>
+        </div>
+        {% endif %}
+
+        <a
+            class="button secondary"
+            id="download-signing-certificate"
+            href="{{ url_for('keys.download_signing_certificate') }}"
+        >
+            Download certificate (.cer)
+        </a>
+
+        <div class="notice" style="margin-top: 16px;">
+            <strong>About your certificate</strong>
+
+            <p style="margin: 6px 0 0;">
+                This certificate contains your public key, not your
+                private key. You can download it for signature
+                verification or manually establish trust in a PDF reader
+                after verifying the fingerprint through a trusted channel.
+            </p>
+        </div>
+    </div>
+
+    {% else %}
+
+    <div class="profile-intro">
+        <span class="icon" aria-hidden="true">✓</span>
+
+        <div>
+            <h2>No signing key yet</h2>
+
+            <p class="muted">
+                Create a signing keypair to digitally sign PDF documents.
+            </p>
+        </div>
+    </div>
+
+    <h3>Generate your signing keypair</h3>
+
+    <p class="muted">
+        Confirm your current Medimo login password.
+    </p>
+
+    <form
+        method="post"
+        action="{{ url_for('keys.generate_signing_keys') }}"
+        class="stack"
+        id="generate-signing-keypair-form"
+        style="max-width: 440px;"
+    >
+        <input
+            type="hidden"
+            name="csrf_token"
+            value="{{ csrf_token }}"
+        >
+
+        <label for="signing-password">
+            Login password
+        </label>
+
+        <input
+            id="signing-password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            placeholder="Enter your login password"
+            required
+        >
+
+        <small>
+            Use the same password you use to log in to Medimo.
+        </small>
+
+        <button
+            class="button primary"
+            type="submit"
+            id="generate-signing-keypair-button"
+        >
+            Generate signing keypair
+        </button>
+
+        <p
+            id="signing-generation-status"
+            class="muted"
+            role="status"
+            aria-live="polite"
+        ></p>
+    </form>
+
+    <div class="notice" style="margin-top: 16px;">
+        <strong>Keep your password safe.</strong>
+
+        <p style="margin: 6px 0 0;">
+            Medimo creates a separate RSA-3072 signing keypair
+            and a certificate valid for 730 days. Your private
+            signing key is encrypted and is never displayed.
+            Key replacement is not currently supported.
+        </p>
+    </div>
+
+    {% endif %}
+</section>
+
+<script>
+(() => {
+    const button = document.getElementById(
+        "copy-signing-fingerprint"
+    );
+
+    const fingerprint = document.getElementById(
+        "signing-fingerprint"
+    );
+
+    const copyStatus = document.getElementById(
+        "signing-copy-status"
+    );
+
+    if (button && fingerprint && copyStatus) {
+        button.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(
+                    fingerprint.value
+                );
+
+                copyStatus.textContent =
+                    "Fingerprint copied.";
+
+            } catch (error) {
+                fingerprint.focus();
+                fingerprint.select();
+
+                copyStatus.textContent =
+                    "Press Cmd+C or Ctrl+C to copy.";
+            }
+        });
+    }
+
+    const form = document.getElementById(
+        "generate-signing-keypair-form"
+    );
+
+    const generateButton = document.getElementById(
+        "generate-signing-keypair-button"
+    );
+
+    const generationStatus = document.getElementById(
+        "signing-generation-status"
+    );
+
+    if (form && generateButton && generationStatus) {
+        form.addEventListener("submit", () => {
+            generateButton.disabled = true;
+
+            generateButton.textContent =
+                "Generating signing keypair...";
+
+            generationStatus.textContent =
+                "Please wait while your signing key is generated.";
+        });
+
+        window.addEventListener("pageshow", () => {
+            generateButton.disabled = false;
+
+            generateButton.textContent =
+                "Generate signing keypair";
+
+            generationStatus.textContent = "";
+        });
+    }
+})();
+</script>
 
 <script>
 (() => {
