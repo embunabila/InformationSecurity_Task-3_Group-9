@@ -3,7 +3,7 @@ import io
 from datetime import datetime, timezone
 
 import pytest
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
     ArrayObject,
     DictionaryObject,
@@ -18,6 +18,7 @@ from pdf_sign import (
 from pdf_verify import (
     extract_signatures,
     _validate_byte_range,
+    _read_raw_signature_dictionary,
 )
 from share_errors import (
     InvalidPdfError,
@@ -104,10 +105,7 @@ def make_pdf_with_contents(contents_hex):
     return pdf_bytes, [0, a, b, c]
 
 
-# --------------------------------------------------
 # Signature extraction tests
-# --------------------------------------------------
-
 def test_extract_signatures_without_signature():
     pdf_bytes = make_pdf()
 
@@ -148,10 +146,7 @@ def test_extract_signatures_with_filled_signature():
     assert signature["byte_range"] == expected_byte_range
 
 
-# --------------------------------------------------
 # ByteRange validation tests
-# --------------------------------------------------
-
 def test_validate_byte_range_with_valid_contents():
     pdf_bytes, byte_range = make_pdf_with_contents(b"30AA")
 
@@ -179,6 +174,34 @@ def test_validate_byte_range_with_signed_pdf():
     assert c == len(pdf_bytes) - b
 
 
+def test_read_raw_signature_dictionary_matches_byte_range():
+    pdf_bytes, byte_range = make_signed_pdf()
+
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+
+    root = reader.trailer["/Root"].get_object()
+    acro_form = root["/AcroForm"].get_object()
+
+    field_ref = acro_form["/Fields"][0]
+    field = field_ref.get_object()
+
+    # Keep the original indirect reference from /V.
+    signature_ref = field.raw_get("/V")
+
+    result = _read_raw_signature_dictionary(
+        pdf_bytes,
+        reader,
+        signature_ref,
+    )
+
+    a, b, c, _ = _validate_byte_range(pdf_bytes, byte_range)
+
+    assert result["byte_range"] == byte_range
+    assert result["contents_start"] == a
+    assert result["contents_end"] == b
+    assert result["contents_token"] == pdf_bytes[a:b]
+
+
 @pytest.mark.parametrize(
     "byte_range",
     [
@@ -186,10 +209,23 @@ def test_validate_byte_range_with_signed_pdf():
         [],
         [0, 1, 2],
         [0, 1, 2, 3, 4],
+
+        # Boolean values must not be accepted as integers.
         [False, 1, 2, 3],
         [0, True, 2, 3],
         [0, 1, False, 3],
         [0, 1, 2, True],
+
+        # Non-integer values must be rejected.
+        [0, 1.5, 2, 3],
+        [0, 1, 2.5, 3],
+        [0, 1, 2, 3.5],
+        ["0", 1, 2, 3],
+        [0, "1", 2, 3],
+        [0, 1, "2", 3],
+        [0, 1, 2, "3"],
+
+        # Negative or structurally invalid values.
         [0, -1, 2, 3],
         [0, 1, -2, 3],
         [0, 1, 2, -3],
@@ -203,6 +239,7 @@ def test_validate_byte_range_with_invalid_values(byte_range):
 
     with pytest.raises(InvalidSignatureError):
         _validate_byte_range(pdf_bytes, byte_range)
+
 
 
 def test_validate_byte_range_with_invalid_opening_bracket():
@@ -244,3 +281,107 @@ def test_validate_byte_range_with_non_hex_contents():
 
     with pytest.raises(InvalidSignatureError):
         _validate_byte_range(pdf_bytes, byte_range)
+
+
+def get_signature_context(pdf_bytes):
+    """Get the reader and signature object reference from a test PDF."""
+    reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+
+    root = reader.trailer["/Root"].get_object()
+    acro_form = root["/AcroForm"].get_object()
+
+    field_ref = acro_form["/Fields"][0]
+    field = field_ref.get_object()
+
+    signature_ref = field.raw_get("/V")
+
+    return reader, signature_ref
+
+
+def replace_signature_dictionary_key(pdf_bytes, old_key, new_key):
+    """Replace a key in the raw signature dictionary without shifting offsets."""
+    reader, signature_ref = get_signature_context(pdf_bytes)
+
+    offset = reader.xref[signature_ref.generation][signature_ref.idnum]
+    dictionary_end = pdf_bytes.find(b">>", offset)
+
+    position = pdf_bytes.find(old_key, offset, dictionary_end)
+
+    assert position >= 0
+    assert len(old_key) == len(new_key)
+
+    return (
+        pdf_bytes[:position]
+        + new_key
+        + pdf_bytes[position + len(old_key):]
+    )
+
+
+def test_read_raw_signature_dictionary_rejects_duplicate_contents():
+    pdf_bytes, _ = make_signed_pdf()
+
+    modified_pdf = replace_signature_dictionary_key(
+        pdf_bytes,
+        b"/SubFilter",
+        b"/Contents ",
+    )
+
+    reader, signature_ref = get_signature_context(modified_pdf)
+
+    with pytest.raises(InvalidSignatureError):
+        _read_raw_signature_dictionary(
+            modified_pdf,
+            reader,
+            signature_ref,
+        )
+
+
+def test_read_raw_signature_dictionary_rejects_duplicate_byte_range():
+    pdf_bytes, _ = make_signed_pdf()
+
+    modified_pdf = replace_signature_dictionary_key(
+        pdf_bytes,
+        b"/SubFilter",
+        b"/ByteRange",
+    )
+
+    reader, signature_ref = get_signature_context(modified_pdf)
+
+    with pytest.raises(InvalidSignatureError):
+        _read_raw_signature_dictionary(
+            modified_pdf,
+            reader,
+            signature_ref,
+        )
+
+
+def test_read_raw_signature_dictionary_rejects_non_hex_contents():
+    pdf_bytes, _ = make_signed_pdf()
+
+    reader, signature_ref = get_signature_context(pdf_bytes)
+
+    original = _read_raw_signature_dictionary(
+        pdf_bytes,
+        reader,
+        signature_ref,
+    )
+
+    start = original["contents_start"]
+    end = original["contents_end"]
+
+    modified_pdf = (
+        pdf_bytes[:start]
+        + b"("
+        + pdf_bytes[start + 1:end - 1]
+        + b")"
+        + pdf_bytes[end:]
+    )
+
+    modified_reader, modified_ref = get_signature_context(modified_pdf)
+
+    with pytest.raises(UnsupportedSignatureError):
+        _read_raw_signature_dictionary(
+            modified_pdf,
+            modified_reader,
+            modified_ref,
+        )
