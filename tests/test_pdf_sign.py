@@ -2,9 +2,12 @@ import hashlib
 import io
 import os
 import re
+import sys
+import types
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
@@ -21,8 +24,15 @@ from pdf_sign import (
     byte_range_digest,
     embed_signature,
     prepare_pdf_for_signing,
+    sign_pdf,
 )
-from share_errors import AlreadySignedError, InvalidPdfError
+from share_errors import (
+    AlreadySignedError,
+    InvalidPdfError,
+    KeyExpiredError,
+    KeyLockedError,
+    KeyUnlockError,
+)
 
 SIGNER = "dummy_user"
 SIGNING_TIME = datetime(2026, 11, 27, 9, 30, 0, tzinfo=timezone.utc)
@@ -630,6 +640,181 @@ class FixtureTests(unittest.TestCase):
                 text = " ".join(values).lower()
                 for team_name in TEAM_NAMES:
                     self.assertNotIn(team_name, text)
+
+USER_ID = 7
+PASSWORD = "dummy-password"
+FAKE_CERT = b"fake-certificate-der"
+FAKE_PRIVATE_KEY = object()
+
+
+class SignPdfTests(unittest.TestCase):
+    def setUp(self):
+        self.pdf = make_pdf()
+        self.now = datetime(2026, 11, 27, 9, 30, 0, 123456, tzinfo=timezone.utc)
+        self.signing_time = self.now.replace(microsecond=0)
+        self.calls = []
+
+        self.signing_key = {
+            "public_key_pem": "fake-pem",
+            "fingerprint": "AAAA BBBB",
+            "certificate_der": FAKE_CERT,
+            "expires_at": "2028-11-27T09:30:00+00:00",
+        }
+
+        signing_keys = types.ModuleType("signing_keys")
+        signing_keys.get_signing_key = MagicMock(
+            side_effect=self._record("get_signing_key", lambda: self.signing_key)
+        )
+        signing_keys.unlock_signing_key = MagicMock(
+            side_effect=self._record("unlock_signing_key", lambda: FAKE_PRIVATE_KEY)
+        )
+        self.fake_cms = b"\x30" + os.urandom(1500)
+        cms = types.ModuleType("cms")
+        cms.build_cms_signed_data = MagicMock(
+            side_effect=self._record("build_cms_signed_data", lambda: self.fake_cms)
+        )
+        self.signing_keys = signing_keys
+        self.cms = cms
+
+        modules = patch.dict(sys.modules, {"signing_keys": signing_keys, "cms": cms})
+        modules.start()
+        self.addCleanup(modules.stop)
+
+        user = patch(
+            "db.get_user_by_id",
+            return_value={"id": USER_ID, "username": SIGNER},
+        )
+        self.get_user = user.start()
+        self.addCleanup(user.stop)
+
+        clock = patch("pdf_sign._utc_now", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def _record(self, name, result):
+        def side_effect(*args):
+            self.calls.append(name)
+            return result()
+        return side_effect
+
+    def sign(self):
+        return sign_pdf(self.pdf, USER_ID, PASSWORD)
+
+    def test_call_order_follows_contract(self):
+        self.sign()
+        self.assertEqual(
+            self.calls,
+            ["get_signing_key", "unlock_signing_key", "build_cms_signed_data"],
+        )
+        self.signing_keys.get_signing_key.assert_called_once_with(USER_ID)
+        self.signing_keys.unlock_signing_key.assert_called_once_with(USER_ID, PASSWORD)
+
+    def test_cms_gets_digest_certificate_key_and_time(self):
+        signed = self.sign()
+        digest, certificate, private_key, signing_time = (
+            self.cms.build_cms_signed_data.call_args.args
+        )
+        byte_range = [int(n) for n in re.search(
+            rb"/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", signed
+        ).groups()]
+
+        self.assertEqual(digest, byte_range_digest(signed, byte_range))
+        self.assertEqual(certificate, FAKE_CERT)
+        self.assertIs(private_key, FAKE_PRIVATE_KEY)
+        self.assertEqual(signing_time, self.signing_time)
+
+    def test_one_signing_time_truncated_to_seconds(self):
+        signed = self.sign()
+        signing_time = self.cms.build_cms_signed_data.call_args.args[3]
+        _, field = find_new_field(signed)
+
+        self.assertEqual(signing_time.microsecond, 0)
+        self.assertEqual(signing_time.utcoffset(), timedelta(0))
+        self.assertEqual(field["/V"].get_object()["/M"], PDF_DATE)
+
+    def test_name_is_username_from_db(self):
+        signed = self.sign()
+        _, field = find_new_field(signed)
+        self.get_user.assert_called_once_with(USER_ID)
+        self.assertEqual(field["/V"].get_object()["/Name"], SIGNER)
+
+    def test_cms_is_embedded(self):
+        signed = self.sign()
+        match = re.search(
+            rb"/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", signed
+        )
+        _, a, b, c = [int(n) for n in match.groups()]
+
+        self.assertTrue(signed.startswith(self.pdf))
+        self.assertEqual(b + c, len(signed))
+        cms_hex = self.fake_cms.hex().upper().encode("ascii")
+        self.assertEqual(
+            signed[a + 1:b - 1], cms_hex.ljust(2 * CONTENTS_SIZE, b"0")
+        )
+
+    def test_expired_key_is_rejected_before_unlock(self):
+        self.signing_key["expires_at"] = "2026-11-27T09:29:59+00:00"
+        with self.assertRaises(KeyExpiredError):
+            self.sign()
+        self.signing_keys.unlock_signing_key.assert_not_called()
+        self.cms.build_cms_signed_data.assert_not_called()
+
+    def test_key_valid_until_the_expiry_second(self):
+        self.signing_key["expires_at"] = "2026-11-27T09:30:00+00:00"
+        self.sign()
+        self.signing_keys.unlock_signing_key.assert_called_once()
+
+    def test_naive_expires_at_is_read_as_utc(self):
+        self.signing_key["expires_at"] = "2026-11-27T09:29:59"
+        with self.assertRaises(KeyExpiredError):
+            self.sign()
+
+    def test_expires_at_in_other_timezone(self):
+        self.signing_key["expires_at"] = "2026-11-27T16:29:59+07:00"
+        with self.assertRaises(KeyExpiredError):
+            self.sign()
+
+    def test_bad_expires_at_is_rejected(self):
+        for value in ("not a date", None, ""):
+            with self.subTest(value=value):
+                self.signing_key["expires_at"] = value
+                with self.assertRaises(ValueError):
+                    self.sign()
+                self.signing_keys.unlock_signing_key.assert_not_called()
+
+    def test_no_signing_key(self):
+        self.signing_keys.get_signing_key.side_effect = None
+        self.signing_keys.get_signing_key.return_value = None
+        with self.assertRaises(ValueError):
+            self.sign()
+        self.signing_keys.unlock_signing_key.assert_not_called()
+
+    def test_unknown_user(self):
+        self.get_user.return_value = None
+        with self.assertRaises(ValueError):
+            self.sign()
+        self.signing_keys.unlock_signing_key.assert_not_called()
+
+    def test_unlock_errors_propagate(self):
+        for error in (KeyUnlockError, KeyLockedError):
+            with self.subTest(error=error.__name__):
+                self.signing_keys.unlock_signing_key.side_effect = error("x")
+                with self.assertRaises(error):
+                    self.sign()
+                self.cms.build_cms_signed_data.assert_not_called()
+
+    def test_pdf_errors_propagate(self):
+        self.pdf = make_pdf_with_form(signature_field="filled")
+        with self.assertRaises(AlreadySignedError):
+            self.sign()
+        self.cms.build_cms_signed_data.assert_not_called()
+
+    def test_cms_too_big(self):
+        self.cms.build_cms_signed_data.side_effect = None
+        self.cms.build_cms_signed_data.return_value = os.urandom(CONTENTS_SIZE + 1)
+        with self.assertRaises(ValueError):
+            self.sign()
+
 
 if __name__ == "__main__":
     unittest.main()
